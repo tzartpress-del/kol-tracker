@@ -1,0 +1,12 @@
+{
+  "name": "kol-tracker-bot",
+  "version": "1.0.0",
+  "main": "kol-bot.js",
+  "scripts": {
+    "start": "node kol-bot.js"
+  },
+  "dependencies": {
+    "node-telegram-bot-api": "^0.64.0",
+    "axios": "^1.6.0"
+  }
+}
