@@ -9,8 +9,8 @@ const GMGN_API_KEY = process.env.GMGN_API_KEY;
 const GMGN_PRIVATE_KEY = process.env.GMGN_PRIVATE_KEY;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 
-const MC_MIN = 40000;
-const MC_MAX = 60000;
+const MC_MIN = 15000;
+const MC_MAX = 150000;
 const MIN_KOL_COUNT = 2;        // min KOLs buying same token
 const MIN_WIN_RATE = 0.55;      // 55% win rate minimum
 const POLL_INTERVAL_MS = 30000; // check every 30s
@@ -263,7 +263,7 @@ async function main() {
     `🤖 *Fully Automatic Mode*\n` +
     `├ No manual wallets needed\n` +
     `├ Scans ALL GMGN KOLs automatically\n` +
-    `├ MC Range: *${fmt(MC_MIN)} – ${fmt(MC_MAX)}*\n` +
+    `├ MC Range: *$15K – $150K*\n` +
     `├ Min KOLs: *${MIN_KOL_COUNT}+*\n` +
     `├ Min Win Rate: *${(MIN_WIN_RATE*100).toFixed(0)}%+*\n` +
     `└ Scan: every 30s\n\n` +
