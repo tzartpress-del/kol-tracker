@@ -354,20 +354,19 @@ async function main() {
   log("🤖 KOL Tracker v8 — KOL + PumpFun Pre-Bond");
 
   await bot.sendMessage(CHAT_ID,
-    `🟢 *KOL Tracker Bot v8 Online*\n\n` +
-    `🚨 *Dual Alert System*\n\n` +
-    `1️⃣ *KOL Signal Alerts*\n` +
-    `├ smart_degen ≥ 1 + KOL ≥ 1\n` +
-    `├ rug < 30% + no wash trading\n` +
-    `└ MC: $15K–$150K\n\n` +
-    `2️⃣ *PumpFun Pre-Bond Alerts*\n` +
-    `├ Bonding curve 60–98% filled\n` +
-    `├ Volume > $20K\n` +
-    `├ Holders > 100\n` +
-    `└ Sorted by highest volume\n\n` +
-    `⚡ Scan every 20s\n` +
-    `🚀 Trojan buy button on every alert`,
-    { parse_mode: "Markdown" }
+    `🟢 KOL Tracker Bot v8 Online\n\n` +
+    `Dual Alert System Active\n\n` +
+    `1. KOL Signal Alerts\n` +
+    `- smart_degen >= 1 + KOL >= 1\n` +
+    `- rug < 30% + no wash trading\n` +
+    `- MC: $15K - $150K\n\n` +
+    `2. PumpFun Pre-Bond Alerts\n` +
+    `- Bonding curve 60-98% filled\n` +
+    `- Volume > $20K\n` +
+    `- Holders > 100\n` +
+    `- Sorted by highest volume\n\n` +
+    `Scan every 20s\n` +
+    `Trojan buy button on every alert`
   );
 
   await scan();
