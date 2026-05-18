@@ -12,9 +12,16 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const MC_MIN = 15000;
 const MC_MAX = 150000;
 const MIN_KOL_COUNT = 2;        // min KOLs buying same token
-const MIN_WIN_RATE = 0.55;      // 55% win rate minimum
+const MIN_WIN_RATE = 0.40;      // 40% win rate minimum
 const POLL_INTERVAL_MS = 30000; // check every 30s
 const ALERT_COOLDOWN_MS = 3600000; // don't re-alert same token for 1hr
+
+// ─── TOP TRADER WALLETS TO ALWAYS TRACK ───────────────────────────────────────
+const TOP_TRADER_WALLETS = {
+  "9yYya3F5EJoLnBNKW6z4bZvyQytMXzDcpU5D6yYr4jqL": "9SLP_KpKS",
+  "84vL38o5zTQjvA2fv7f3MgwXVBm8rBs1QBVXHtranQy5": "2snH_kKuS",
+  "BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB": "Axio_TTSk",
+};
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
@@ -213,66 +220,154 @@ async function sendAlert(token, traders) {
   log(`🚨 Alert sent for $${symbol} — ${traders.length} KOLs`);
 }
 
-// ─── MAIN SCAN LOOP ───────────────────────────────────────────────────────────
-async function scan() {
-  log("🔍 Scanning for KOL overlap...");
-  const tokens = await getTrendingKOLTokens();
-  log(`Found ${tokens.length} tokens in MC range with KOL activity`);
+// ─── TRACK TOP TRADER WALLETS DIRECTLY ───────────────────────────────────────
+const lastSignature = {};
+const recentBuys = {};
 
-  for (const token of tokens) {
-    const mint = token.address;
+async function getRecentTxs(wallet) {
+  try {
+    const res = await axios.get(
+      `https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${HELIUS_API_KEY}&limit=10&type=SWAP`,
+      { timeout: 10000 }
+    );
+    return res.data || [];
+  } catch(e) { log(`TX error: ${e.message}`); return []; }
+}
 
-    // Skip recently alerted
-    const lastAlert = alerted.get(mint);
-    if (lastAlert && Date.now() - lastAlert < ALERT_COOLDOWN_MS) continue;
+function extractBoughtToken(tx, wallet) {
+  try {
+    const WSOL = "So11111111111111111111111111111111111111112";
+    const recv = (tx.tokenTransfers||[]).find(t =>
+      t.toUserAccount === wallet && t.mint !== WSOL
+    );
+    return recv?.mint || null;
+  } catch { return null; }
+}
 
-    // Get top KOL traders for this token
-    const topTraders = await getTopTraders(mint);
-    await new Promise(r => setTimeout(r, 500));
+async function pollTopTraderWallets() {
+  for (const [wallet, name] of Object.entries(TOP_TRADER_WALLETS)) {
+    const txs = await getRecentTxs(wallet);
+    if (!txs.length) continue;
+    const newTxs = lastSignature[wallet]
+      ? txs.filter(t => t.signature !== lastSignature[wallet])
+      : txs.slice(0, 3);
+    if (newTxs.length) lastSignature[wallet] = txs[0].signature;
 
-    if (!topTraders.length) continue;
+    for (const tx of newTxs) {
+      const mint = extractBoughtToken(tx, wallet);
+      if (!mint) continue;
 
-    // Fetch win rates for each trader
-    const tradersWithStats = [];
-    for (const trader of topTraders.slice(0, 10)) {
-      const wallet = trader.address || trader.maker;
-      if (!wallet) continue;
-      const stats = await getWalletStats(wallet);
-      await new Promise(r => setTimeout(r, 300));
-      if (!stats) continue;
-      if (stats.winRate < MIN_WIN_RATE) continue; // skip low win rate
-      tradersWithStats.push({ ...stats, wallet });
+      // Get token data
+      let mc = 0, symbol = "???", tokenData = null;
+      try {
+        const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { timeout: 8000 });
+        const pairs = (res.data?.pairs||[]).filter(p=>p.chainId==="solana");
+        if (pairs.length) {
+          pairs.sort((a,b)=>(b.liquidity?.usd||0)-(a.liquidity?.usd||0));
+          const p = pairs[0];
+          mc = p.fdv || p.marketCap || 0;
+          symbol = p.baseToken?.symbol || "???";
+          tokenData = {
+            address: mint, symbol, market_cap: mc,
+            price: p.priceUsd, volume: p.volume?.h1 || 0,
+            liquidity: p.liquidity?.usd || 0,
+            open_timestamp: p.pairCreatedAt ? p.pairCreatedAt/1000 : null,
+            price_change_percent1h: p.priceChange?.h1 || 0,
+            renounced_mint: 0, renounced_freeze_account: 0,
+            is_honeypot: 0, creator_token_status: null,
+            renowned_count: 0, smart_buy_24h: 0,
+          };
+        }
+      } catch(e) {}
+
+      if (!mc || mc < MC_MIN || mc > MC_MAX) continue;
+      log(`👛 Top trader ${name} bought $${symbol} @ ${fmt(mc)} MC`);
+
+      if (!recentBuys[mint]) recentBuys[mint] = {};
+      recentBuys[mint][name] = { wallet, ts: Date.now() };
+
+      // Clean old entries
+      const cutoff = Date.now() - 7200000;
+      for (const [m, buyers] of Object.entries(recentBuys)) {
+        for (const [k, v] of Object.entries(buyers)) {
+          if (v.ts < cutoff) delete recentBuys[m][k];
+        }
+        if (!Object.keys(recentBuys[m]).length) delete recentBuys[m];
+      }
+
+      const buyers = Object.keys(recentBuys[mint] || {});
+      if (buyers.length >= MIN_KOL_COUNT && !alerted.has(mint) && tokenData) {
+        alerted.set(mint, Date.now());
+        const traderStats = buyers.map(b => ({
+          name: b,
+          winRate: null,
+          avgMC: null,
+          realizedPnl: null,
+        }));
+        await sendAlert(tokenData, traderStats);
+      }
     }
-
-    // Need 2+ quality KOLs
-    if (tradersWithStats.length < MIN_KOL_COUNT) continue;
-
-    // Fire alert!
-    alerted.set(mint, Date.now());
-    await sendAlert(token, tradersWithStats);
     await new Promise(r => setTimeout(r, 1000));
   }
 }
 
+// ─── MAIN SCAN LOOP ───────────────────────────────────────────────────────────
+async function scan() {
+  log("🔍 Scanning GMGN trending + top trader wallets...");
+
+  // Run both in parallel
+  await Promise.all([
+    // 1. GMGN trending scan
+    (async () => {
+      const tokens = await getTrendingKOLTokens();
+      log(`GMGN: ${tokens.length} tokens in MC range with KOL activity`);
+      for (const token of tokens) {
+        const mint = token.address;
+        const lastAlert = alerted.get(mint);
+        if (lastAlert && Date.now() - lastAlert < ALERT_COOLDOWN_MS) continue;
+        const topTraders = await getTopTraders(mint);
+        await new Promise(r => setTimeout(r, 500));
+        if (!topTraders.length) continue;
+        const tradersWithStats = [];
+        for (const trader of topTraders.slice(0, 10)) {
+          const wallet = trader.address || trader.maker;
+          if (!wallet) continue;
+          const stats = await getWalletStats(wallet);
+          await new Promise(r => setTimeout(r, 300));
+          if (!stats) continue;
+          if (stats.winRate < MIN_WIN_RATE) continue;
+          tradersWithStats.push({ ...stats, wallet });
+        }
+        if (tradersWithStats.length < MIN_KOL_COUNT) continue;
+        alerted.set(mint, Date.now());
+        await sendAlert(token, tradersWithStats);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    })(),
+
+    // 2. Top trader wallet polling
+    pollTopTraderWallets(),
+  ]);
+}
+
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("🤖 KOL Tracker v4 — Fully Automatic");
+  log("🤖 KOL Tracker v5 — Auto + Top Traders");
 
   await bot.sendMessage(CHAT_ID,
-    `🟢 *KOL Tracker Bot v4 Online*\n\n` +
-    `🤖 *Fully Automatic Mode*\n` +
-    `├ No manual wallets needed\n` +
-    `├ Scans ALL GMGN KOLs automatically\n` +
+    `🟢 *KOL Tracker Bot v5 Online*\n\n` +
+    `🤖 *Dual Mode Active*\n` +
+    `├ 🌐 GMGN auto-scan ALL KOLs\n` +
+    `├ 👛 Watching *${Object.keys(TOP_TRADER_WALLETS).length} top trader wallets*\n` +
     `├ MC Range: *$15K – $150K*\n` +
     `├ Min KOLs: *${MIN_KOL_COUNT}+*\n` +
     `├ Min Win Rate: *${(MIN_WIN_RATE*100).toFixed(0)}%+*\n` +
     `└ Scan: every 30s\n\n` +
-    `🔥 Powered by GMGN API\n` +
+    `🔥 Powered by GMGN + Helius\n` +
     `✅ Win rates • Avg entry MC • Security checks`,
     { parse_mode: "Markdown" }
   );
 
-  // Run immediately then loop
   await scan();
   setInterval(scan, POLL_INTERVAL_MS);
 }
