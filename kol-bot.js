@@ -78,22 +78,31 @@ function signalLabel(score) {
   return "🟡 LOW";
 }
 
-// ─── GMGN FETCH HELPER ───────────────────────────────────────────────────────
-async function fetchGMGN(url) {
-  try {
-    const res = await axios.get(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept": "application/json",
-        "Referer": "https://gmgn.ai/",
-      },
-      timeout: 12000
-    });
-    return res.data;
-  } catch(e) {
-    log(`Fetch error: ${e.message}`);
-    return null;
+// ─── GMGN FETCH HELPER WITH RETRY ────────────────────────────────────────────
+async function fetchGMGN(url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await axios.get(url, {
+        headers: {
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+          "Accept": "application/json",
+          "Referer": "https://gmgn.ai/",
+        },
+        timeout: 12000
+      });
+      return res.data;
+    } catch(e) {
+      const status = e.response?.status;
+      if (status === 429 || status === 403) {
+        log(`Rate limited (${status}), waiting ${(i+1)*5}s...`);
+        await new Promise(r => setTimeout(r, (i+1) * 5000));
+      } else {
+        log(`Fetch error: ${e.message}`);
+        return null;
+      }
+    }
   }
+  return null;
 }
 
 // ─── 1. KOL/SMART MONEY SIGNALS ──────────────────────────────────────────────
@@ -204,10 +213,12 @@ async function sendKOLAlert(token) {
   const liq = fmt(token.liquidity || 0);
   const change1h = token.price_change_percent1h || 0;
   const changeStr = change1h > 0 ? `📈 +${change1h.toFixed(1)}%` : `📉 ${change1h.toFixed(1)}%`;
+  const score = signalScore(token);
+  const label = signalLabel(score);
   const isReentry = token.alertType === "REENTRY";
   const alertHeader = isReentry
-    ? `♻️ *RE-ENTRY SIGNAL* ♻️\n${label} - Score: ${score}/11\n`
-    : `🚨 *KOL SIGNAL DETECTED* 🚨\n${label} - Score: ${score}/11\n`;
+    ? `♻️ *RE-ENTRY SIGNAL* ♻️\n${label} - Score: ${score}/11`
+    : `🚨 *KOL SIGNAL DETECTED* 🚨\n${label} - Score: ${score}/11`;
   const mintR = token.renounced_mint === 1 ? "🟢" : "🔴";
   const freezeR = token.renounced_freeze_account === 1 ? "🟢" : "🔴";
   const rugPct = token.rug_ratio !== undefined ? `${(token.rug_ratio * 100).toFixed(0)}%` : "N/A";
