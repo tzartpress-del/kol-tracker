@@ -858,6 +858,13 @@ async function main() {
 
   await scan();
   setInterval(scan, POLL_INTERVAL_MS);
+  const {
+  hardFilter,
+  getVelocity,
+  enrichSignal,
+  processClaudeBatch,
+  sortSignals,
+} = require("./refinements");
 }
 
 main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
