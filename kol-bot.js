@@ -151,7 +151,7 @@ or
     const res = await axios.post(
       "https://api.anthropic.com/v1/messages",
       {
-        model: "claude-sonnet-4-20250514",
+        model: "claude-haiku-4-5-20251001",
         max_tokens: 200,
         messages: [{ role: "user", content: prompt }]
       },
@@ -171,8 +171,7 @@ or
     log(`Claude: ${token.symbol} -> ${result.decision} (${result.reason}) conf:${result.confidence}%`);
     return result;
   } catch(e) {
-    log(`Claude filter error: ${e.message}`);
-    // If Claude fails, fall back to basic approval
+    log(`Claude filter error: ${e.response?.status} ${e.response?.data?.error?.message || e.message}`);
     return { decision: "APPROVE", reason: "Claude unavailable, using fallback", risk: "MEDIUM", confidence: 50 };
   }
 }
@@ -754,4 +753,3 @@ async function main() {
 }
 
 main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
-
