@@ -177,6 +177,69 @@ or
 }
 
 // ─── PERFORMANCE TRACKER ──────────────────────────────────────────────────────
+// ─── PROVEN INSIDER WALLETS ───────────────────────────────────────────────────
+const INSIDER_WALLETS = {
+  "AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm": "InsiderAlpha1",
+  "4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t": "InsiderAlpha2",
+  "8zFZHuSRuDpuAR7J6FzwyF3vKNx4CVW3DFHJerQhc7Zd": "InsiderAlpha3",
+  "9yYya3F5EJoLnBNKW6z4bZvyQytMXzDcpU5D6yYr4jqL": "9SLP_KpKS",
+  "84vL38o5zTQjvA2fv7f3MgwXVBm8rBs1QBVXHtranQy5": "2snH_kKuS",
+  "BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB": "Axio_TTSk",
+};
+
+// ─── INSIDER WALLET POLLING ───────────────────────────────────────────────────
+const lastSig = {};
+const insiderBuys = {};
+const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
+
+async function pollInsiderWallets() {
+  for (const [wallet, name] of Object.entries(INSIDER_WALLETS)) {
+    try {
+      const res = await axios.get(
+        `https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${HELIUS_API_KEY}&limit=5&type=SWAP`,
+        { timeout: 8000 }
+      );
+      const txs = res.data || [];
+      if (!txs.length) continue;
+      const newTxs = lastSig[wallet]
+        ? txs.filter(t => t.signature !== lastSig[wallet])
+        : txs.slice(0, 2);
+      if (newTxs.length) lastSig[wallet] = txs[0].signature;
+      for (const tx of newTxs) {
+        const WSOL = "So11111111111111111111111111111111111111112";
+        const recv = (tx.tokenTransfers||[]).find(t => t.toUserAccount===wallet && t.mint!==WSOL);
+        if (!recv?.mint) continue;
+        const mint = recv.mint;
+        if (!insiderBuys[mint]) insiderBuys[mint] = {};
+        insiderBuys[mint][name] = Date.now();
+        log(`👛 Insider ${name} bought ${mint.slice(0,8)}...`);
+      }
+    } catch(e) {}
+    await new Promise(r => setTimeout(r, 500));
+  }
+  // Clean old entries > 2hrs
+  const cutoff = Date.now() - 7200000;
+  for (const [mint, buyers] of Object.entries(insiderBuys)) {
+    for (const [k, ts] of Object.entries(buyers)) {
+      if (ts < cutoff) delete insiderBuys[mint][k];
+    }
+    if (!Object.keys(insiderBuys[mint]).length) delete insiderBuys[mint];
+  }
+}
+
+// ─── NETFLOW DETECTION ────────────────────────────────────────────────────────
+function getNetflow(token) {
+  const buys = token.buy_5m || token.swaps_5m || 0;
+  const sells = token.sell_5m || 0;
+  const buyVol = token.buy_volume_5m || 0;
+  const sellVol = token.sell_volume_5m || 0;
+  const ratio = sells > 0 ? (buys / sells).toFixed(1) : buys > 0 ? "∞" : "0";
+  const netVol = buyVol - sellVol;
+  const isAccumulating = netVol > 0 && buys > sells;
+  return { ratio, netVol, isAccumulating, buys, sells };
+}
+
+// ─── MILESTONE PERFORMANCE TRACKER ───────────────────────────────────────────
 async function getTokenPrice(mint) {
   try {
     const res = await axios.get(
@@ -195,70 +258,69 @@ async function getTokenPrice(mint) {
 }
 
 async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId) {
-  // Store in tracker
   performanceTracker.set(mint, {
-    alertPrice,
-    alertMC,
-    symbol,
-    alertTime: Date.now(),
-    alertMsgId,
-    peakX: 1,
-    checked: 0,
+    alertPrice, alertMC, symbol,
+    alertTime: Date.now(), alertMsgId,
+    peakX: 1, notified2x: false, notified5x: false, notified10x: false,
   });
 
-  // Schedule checks
-  for (const delay of TRACK_INTERVALS_MS) {
-    setTimeout(async () => {
-      const tracker = performanceTracker.get(mint);
-      if (!tracker) return;
+  // Check every 3 minutes for 24 hours
+  const interval = setInterval(async () => {
+    const tracker = performanceTracker.get(mint);
+    if (!tracker) { clearInterval(interval); return; }
 
-      const current = await getTokenPrice(mint);
-      if (!current || !current.price || !alertPrice) return;
+    // Stop after 24 hours
+    if (Date.now() - tracker.alertTime > 86400000) {
+      // Final report
+      await bot.sendMessage(CHAT_ID,
+        `📋 Final: $${symbol}\n` +
+        `Peak: ${tracker.peakX.toFixed(2)}x\n` +
+        `Verdict: ${tracker.peakX >= 10 ? "MOONSHOT 🌙" : tracker.peakX >= 5 ? "BANGER 🔥" : tracker.peakX >= 2 ? "SOLID WIN ✅" : tracker.peakX >= 1 ? "BREAKEVEN 🟡" : "RUG 🔴"}`
+      ).catch(() => {});
+      performanceTracker.delete(mint);
+      clearInterval(interval);
+      return;
+    }
 
-      const xGain = current.price / alertPrice;
-      const xLabel = xGain.toFixed(2);
-      tracker.checked++;
+    const current = await getTokenPrice(mint);
+    if (!current?.price || !alertPrice) return;
+    const xGain = current.price / alertPrice;
+    if (xGain > tracker.peakX) tracker.peakX = xGain;
 
-      // Update peak
-      if (xGain > tracker.peakX) tracker.peakX = xGain;
+    // Milestone alerts only
+    if (xGain >= 10 && !tracker.notified10x) {
+      tracker.notified10x = true;
+      botStats.hits10x++;
+      await bot.sendMessage(CHAT_ID,
+        `🌙 10x MILESTONE!\n\n$${symbol} is up 10x from alert!\nMC: ${fmt(current.mc)}\nLiq: ${fmt(current.liquidity)}\n\nConsider taking profit!`,
+        { reply_to_message_id: alertMsgId }
+      ).catch(() => {});
+    } else if (xGain >= 5 && !tracker.notified5x) {
+      tracker.notified5x = true;
+      botStats.hits5x++;
+      await bot.sendMessage(CHAT_ID,
+        `🚀 5x MILESTONE!\n\n$${symbol} is up 5x from alert!\nMC: ${fmt(current.mc)}\nLiq: ${fmt(current.liquidity)}\n\nConsider taking some profit!`,
+        { reply_to_message_id: alertMsgId }
+      ).catch(() => {});
+    } else if (xGain >= 2 && !tracker.notified2x) {
+      tracker.notified2x = true;
+      botStats.hits2x++;
+      await bot.sendMessage(CHAT_ID,
+        `✅ 2x MILESTONE!\n\n$${symbol} is up 2x from alert!\nMC: ${fmt(current.mc)}\nLiq: ${fmt(current.liquidity)}\n\nConsider taking 25% profit!`,
+        { reply_to_message_id: alertMsgId }
+      ).catch(() => {});
+    }
 
-      // Update stats
-      if (xGain >= 10 && botStats.hits10x < Math.floor(xGain/10)) botStats.hits10x++;
-      else if (xGain >= 5 && botStats.hits5x < Math.floor(xGain/5)) botStats.hits5x++;
-      else if (xGain >= 2 && botStats.hits2x < Math.floor(xGain/2)) botStats.hits2x++;
-      if (current.liquidity < 1000) botStats.rugs++;
-
-      const timeLabel = delay < 3600000 ? `${delay/60000}m` : `${delay/3600000}h`;
-      const emoji = xGain >= 5 ? "🚀" : xGain >= 2 ? "🟢" : xGain >= 1 ? "🟡" : "🔴";
-      const liqWarning = current.liquidity < 5000 ? "\nLIQUIDITY LOW - consider exit!" : "";
-
-      const msg =
-        `${emoji} Performance Update\n\n` +
-        `$${symbol} at ${timeLabel} after alert\n\n` +
-        `Alert MC: ${fmt(alertMC)}\n` +
-        `Current MC: ${fmt(current.mc)}\n` +
-        `Gain: ${xLabel}x ${emoji}\n` +
-        `Peak so far: ${tracker.peakX.toFixed(2)}x\n` +
-        `Liq: ${fmt(current.liquidity)}${liqWarning}\n\n` +
-        `${xGain >= 2 ? "Consider taking some profit!" : xGain < 0.5 ? "Significant loss - review position" : "Holding steady"}`;
-
-      await bot.sendMessage(CHAT_ID, msg, {
-        reply_to_message_id: alertMsgId,
-      }).catch(() => {});
-
-      // Final report at 24h
-      if (tracker.checked >= TRACK_INTERVALS_MS.length) {
-        await bot.sendMessage(CHAT_ID,
-          `📋 Final Report: $${symbol}\n\n` +
-          `Peak gain: ${tracker.peakX.toFixed(2)}x\n` +
-          `Final: ${xLabel}x\n` +
-          `Verdict: ${tracker.peakX >= 5 ? "BANGER" : tracker.peakX >= 2 ? "SOLID WIN" : tracker.peakX >= 1 ? "BREAKEVEN" : "RUG"}\n\n` +
-          `Bot accuracy improving with each trade!`
-        ).catch(() => {});
-        performanceTracker.delete(mint);
-      }
-    }, delay);
-  }
+    // Rug warning
+    if (current.liquidity < 2000 && tracker.peakX > 1.5) {
+      await bot.sendMessage(CHAT_ID,
+        `⚠️ LIQUIDITY WARNING!\n\n$${symbol} liquidity dropping!\nLiq: ${fmt(current.liquidity)}\nConsider exiting!`,
+        { reply_to_message_id: alertMsgId }
+      ).catch(() => {});
+      performanceTracker.delete(mint);
+      clearInterval(interval);
+    }
+  }, 3 * 60 * 1000); // check every 3 mins
 }
 
 // ─── GMGN FETCH ───────────────────────────────────────────────────────────────
@@ -393,6 +455,14 @@ async function sendKOLAlert(token, aiResult) {
   const devStatus = token.creator_token_status === "sell" ? "Sold" : token.creator_token_status === "hold" ? "Holding" : "N/A";
   const smartCount = token.smart_degen_count || 0;
   const kolCount = token.renowned_count || 0;
+  const netflow = getNetflow(token);
+  const insiders = Object.keys(insiderBuys[token.address] || {});
+  const insiderStr = insiders.length > 0
+    ? `\n\n👛 *Insider Wallets*\n${insiders.map(i => `- ${i}`).join("\n")}`
+    : "";
+  const netflowStr = netflow.buys > 0
+    ? `\n\n📊 *Netflow (5m)*\nBuys: ${netflow.buys} | Sells: ${netflow.sells}\nRatio: ${netflow.ratio}:1 ${netflow.isAccumulating ? "🟢 Accumulating" : "🔴 Selling"}`
+    : "";
 
   const riskEmoji = aiResult.risk === "LOW" ? "🟢" : aiResult.risk === "MEDIUM" ? "🟡" : "🔴";
   const header = isReentry ? "REENTRY SIGNAL" : "KOL SIGNAL DETECTED";
@@ -418,7 +488,8 @@ async function sendKOLAlert(token, aiResult) {
     `Confidence: ${aiResult.confidence}%\n\n` +
     `🔒 *Security*\n` +
     `Dev: ${devStatus} | Mint: ${mintR} | Freeze: ${freezeR}\n` +
-    `Rug: ${rugPct}\n\n` +
+    `Rug: ${rugPct}\n` +
+    `${netflowStr}${insiderStr}\n\n` +
     `💰 *Snipe 0.1 SOL?*`;
 
   const keyboard = {
@@ -671,6 +742,9 @@ async function sendUltraEarlyAlert(token, aiResult) {
 async function scan() {
   log("Scanning GMGN for signals...");
 
+  // Poll insider wallets in background
+  pollInsiderWallets().catch(e => log(`Insider poll error: ${e.message}`));
+
   const [kolTokens, pumpTokens, ultraEarlyTokens] = await Promise.all([
     getKOLSignals(),
     getPumpFunPrebond(),
@@ -727,24 +801,25 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker v10 - Ultra Early + AI");
+  log("KOL Tracker v11 - Full Upgrade");
 
   await bot.sendMessage(CHAT_ID,
-    `KOL Tracker Bot v10 Online\n\n` +
-    `3 Alert Types Active\n\n` +
-    `1. Ultra Early Launch (NEW)\n` +
-    `- Under 30 mins old\n` +
-    `- Bonding curve 3-60%\n` +
-    `- Strong buy/sell ratio\n` +
-    `- 10x-1000x potential\n\n` +
-    `2. KOL Signal Alerts\n` +
-    `- smart_degen + KOL overlap\n` +
-    `- Claude AI filtered\n` +
-    `- 24hr age filter\n\n` +
-    `3. PumpFun Pre-Bond\n` +
-    `- 60-98% bonding curve\n` +
-    `- Near migration\n\n` +
-    `Performance tracking on all alerts\n` +
+    `KOL Tracker Bot v11 Online\n\n` +
+    `Upgrades Active\n\n` +
+    `1. Claude AI Filter - FIXED\n` +
+    `2. Milestone Tracking Only\n` +
+    `   - Alerts at 2x, 5x, 10x\n` +
+    `   - Liquidity warning\n` +
+    `   - 24hr final report\n\n` +
+    `3. Proven Insider Wallets\n` +
+    `   - 6 high win rate wallets\n` +
+    `   - Shows on every alert\n\n` +
+    `4. Netflow Detection\n` +
+    `   - Buy/sell ratio\n` +
+    `   - Accumulation signal\n\n` +
+    `5. Ultra Early Launches\n` +
+    `6. PumpFun Pre-Bond\n` +
+    `7. KOL Signal Alerts\n\n` +
     `Scan every 20s`
   );
 
