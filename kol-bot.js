@@ -14,6 +14,8 @@ const MAX_RUG_RATIO = 0.3;
 const MIN_LIQUIDITY = 5000;
 const POLL_INTERVAL_MS = 20000;
 const ALERT_COOLDOWN_MS = 3600000;
+const MAX_TOKEN_AGE_MS = 24 * 60 * 60 * 1000;  // only show tokens < 24hrs old
+const REENTRY_MIN_VOLUME = 50000;               // $50K volume spike for re-entry
 
 // PumpFun pre-bond filters
 const PUMP_MIN_VOLUME = 20000;      // min $20K volume (high activity)
@@ -113,15 +115,22 @@ async function getKOLSignals() {
       if (!t.address || seen.has(t.address)) continue;
       seen.add(t.address);
       const mc = t.market_cap || 0;
+      const tokenAge = t.open_timestamp ? (Date.now() - t.open_timestamp * 1000) : null;
+      const isNew = tokenAge !== null && tokenAge <= MAX_TOKEN_AGE_MS;
+      const volume = t.volume || 0;
+      const isReentry = !isNew && volume >= REENTRY_MIN_VOLUME &&
+        (t.smart_degen_count || 0) >= 2; // needs 2+ smart money for re-entry
+
       if (
         mc >= MC_MIN && mc <= MC_MAX &&
         (t.smart_degen_count || 0) >= MIN_SMART_DEGEN &&
         (t.renowned_count || 0) >= MIN_RENOWNED &&
         (t.rug_ratio || 0) < MAX_RUG_RATIO &&
         (t.liquidity || 0) >= MIN_LIQUIDITY &&
-        !t.is_wash_trading
+        !t.is_wash_trading &&
+        (isNew || isReentry)
       ) {
-        results.push({ ...t, alertType: "KOL" });
+        results.push({ ...t, alertType: isReentry ? "REENTRY" : "KOL", tokenAge });
       }
     }
   }
@@ -195,8 +204,10 @@ async function sendKOLAlert(token) {
   const liq = fmt(token.liquidity || 0);
   const change1h = token.price_change_percent1h || 0;
   const changeStr = change1h > 0 ? `📈 +${change1h.toFixed(1)}%` : `📉 ${change1h.toFixed(1)}%`;
-  const score = signalScore(token);
-  const label = signalLabel(score);
+  const isReentry = token.alertType === "REENTRY";
+  const alertHeader = isReentry
+    ? `♻️ *RE-ENTRY SIGNAL* ♻️\n${label} - Score: ${score}/11\n`
+    : `🚨 *KOL SIGNAL DETECTED* 🚨\n${label} - Score: ${score}/11\n`;
   const mintR = token.renounced_mint === 1 ? "🟢" : "🔴";
   const freezeR = token.renounced_freeze_account === 1 ? "🟢" : "🔴";
   const rugPct = token.rug_ratio !== undefined ? `${(token.rug_ratio * 100).toFixed(0)}%` : "N/A";
@@ -209,8 +220,7 @@ async function sendKOLAlert(token) {
   const kolCount = token.renowned_count || 0;
 
   const msg =
-    `🚨 *KOL SIGNAL DETECTED* 🚨\n` +
-    `${label} — Score: ${score}/11\n\n` +
+    `${alertHeader}\n` +
     `*$${symbol}*\n` +
     `├ \`${mint}\`\n` +
     `└ ⏱ ${age} | 👁 ${holders} holders\n\n` +
