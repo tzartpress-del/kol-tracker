@@ -352,15 +352,16 @@ async function fetchGMGN(url, retries = 3) {
 
 // ─── GET KOL SIGNALS ─────────────────────────────────────────────────────────
 async function getKOLSignals() {
-  const urls = [
-    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
-    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/5m?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&limit=100`,
-    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&limit=100`,
+  const results = [];
+  const seen = new Set();
+
+  // Try GMGN with authenticated headers first
+  const gmgnUrls = [
+    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
+    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
   ];
 
-  const responses = await Promise.allSettled(urls.map(u => fetchGMGN(u)));
-  const seen = new Set();
-  const results = [];
+  const responses = await Promise.allSettled(gmgnUrls.map(u => fetchGMGN(u)));
 
   for (const r of responses) {
     if (r.status !== "fulfilled" || !r.value) continue;
@@ -368,12 +369,10 @@ async function getKOLSignals() {
     for (const t of tokens) {
       if (!t.address || seen.has(t.address)) continue;
       seen.add(t.address);
-
       const mc = t.market_cap || 0;
       const tokenAge = t.open_timestamp ? (Date.now() - t.open_timestamp * 1000) : null;
       const isNew = tokenAge !== null && tokenAge <= MAX_TOKEN_AGE_MS;
       const isReentry = !isNew && (t.volume || 0) >= REENTRY_MIN_VOLUME && (t.smart_degen_count || 0) >= 2;
-
       if (
         mc >= MC_MIN && mc <= MC_MAX &&
         (t.smart_degen_count || 0) >= MIN_SMART_DEGEN &&
@@ -386,6 +385,40 @@ async function getKOLSignals() {
         results.push({ ...t, alertType: isReentry ? "REENTRY" : "KOL", tokenAge });
       }
     }
+  }
+
+  // Fallback: DexScreener new pairs if GMGN returns nothing
+  if (results.length === 0) {
+    log("GMGN returned 0 results, trying DexScreener fallback...");
+    try {
+      const res = await axios.get(
+        `https://api.dexscreener.com/token-profiles/latest/v1`,
+        { timeout: 10000 }
+      );
+      const tokens = res.data || [];
+      for (const t of tokens) {
+        if (!t.tokenAddress || seen.has(t.tokenAddress)) continue;
+        if (t.chainId !== "solana") continue;
+        seen.add(t.tokenAddress);
+        results.push({
+          address: t.tokenAddress,
+          symbol: t.header || t.description?.slice(0,6) || "???",
+          market_cap: 0,
+          liquidity: 0,
+          volume: 0,
+          smart_degen_count: 0,
+          renowned_count: 0,
+          rug_ratio: 0,
+          is_wash_trading: false,
+          renounced_mint: 0,
+          renounced_freeze_account: 0,
+          alertType: "KOL",
+          tokenAge: 0,
+          open_timestamp: Date.now() / 1000,
+        });
+        if (results.length >= 5) break;
+      }
+    } catch(e) { log(`DexScreener fallback error: ${e.message}`); }
   }
 
   results.sort((a, b) => signalScore(b) - signalScore(a));
