@@ -1,6 +1,12 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 
+// ─── MODULE IMPORTS ───────────────────────────────────────────────────────────
+const brain = require("./brain");
+const security = require("./security");
+const commands = require("./commands");
+const weeklyReport = require("./weekly-report");
+
 // ─── PRODUCTION STABILITY ────────────────────────────────────────────────────
 process.on("unhandledRejection", console.error);
 process.on("uncaughtException", console.error);
@@ -67,7 +73,7 @@ const paperPortfolio = {
   losses: 0,
 };
 
-function paperBuy(mint, price, symbol, signalType) {
+function paperBuy(mint, price, symbol, signalType, score) {
   if (!PAPER_TRADING) return;
   if (paperPortfolio.openPositions.has(mint)) return;
   if (paperPortfolio.capital < PAPER_TRADE_SIZE_SOL) {
@@ -76,15 +82,16 @@ function paperBuy(mint, price, symbol, signalType) {
   }
   paperPortfolio.capital -= PAPER_TRADE_SIZE_SOL;
   paperPortfolio.openPositions.set(mint, {
-    entryPrice: price,
-    size: PAPER_TRADE_SIZE_SOL,
-    symbol,
-    signalType,
-    openTime: Date.now(),
-    tp1Hit: false,
-    tp2Hit: false,
+    entryPrice: price, size: PAPER_TRADE_SIZE_SOL,
+    symbol, signalType, openTime: Date.now(),
+    tp1Hit: false, tp2Hit: false,
   });
-  log(`📝 Paper BUY: $${symbol} @ $${price} | Capital: ${paperPortfolio.capital.toFixed(3)} SOL`);
+  // Log to brain
+  try {
+    const db = brain.loadDB();
+    brain.logTrade(db, { mint, symbol, signalType, entryPrice: price, entryTime: Date.now(), score: score||0, sizeSol: PAPER_TRADE_SIZE_SOL });
+  } catch(e) { log(`Brain log error: ${e.message}`); }
+  log(`Paper BUY: $${symbol} @ $${price} | Capital: ${paperPortfolio.capital.toFixed(3)} SOL`);
 }
 
 function paperSell(mint, price, reason) {
@@ -96,35 +103,29 @@ function paperSell(mint, price, reason) {
   let pnlSol = 0;
 
   if (reason === "tp1") {
-    // Take 25% at 2x
     pnlSol = pos.size * 0.25 * (xGain - 1);
     paperPortfolio.capital += pos.size * 0.25 * xGain;
     pos.size *= 0.75;
     pos.tp1Hit = true;
   } else if (reason === "tp2") {
-    // Take 50% of remaining at 3x
     pnlSol = pos.size * 0.5 * (xGain - 1);
     paperPortfolio.capital += pos.size * 0.5 * xGain;
     pos.size *= 0.5;
     pos.tp2Hit = true;
   } else {
-    // Full exit
     pnlSol = pos.size * (xGain - 1);
     paperPortfolio.capital += pos.size * xGain;
     paperPortfolio.totalPnl += pnlSol;
     if (pnlSol > 0) paperPortfolio.wins++;
     else paperPortfolio.losses++;
-    paperPortfolio.trades.push({
-      symbol: pos.symbol,
-      entryPrice: pos.entryPrice,
-      exitPrice: price,
-      xGain,
-      pnlSol,
-      signalType: pos.signalType,
-      duration: Date.now() - pos.openTime,
-    });
+    paperPortfolio.trades.push({ symbol: pos.symbol, entryPrice: pos.entryPrice, exitPrice: price, xGain, pnlSol, signalType: pos.signalType, duration: Date.now() - pos.openTime });
     paperPortfolio.openPositions.delete(mint);
-    log(`📝 Paper SELL: $${pos.symbol} @ ${xGain.toFixed(2)}x | PnL: ${pnlSol > 0 ? "+" : ""}${pnlSol.toFixed(4)} SOL`);
+    // Close in brain
+    try {
+      const db = brain.loadDB();
+      brain.closeTrade(db, mint, price, reason);
+    } catch(e) { log(`Brain close error: ${e.message}`); }
+    log(`Paper SELL: $${pos.symbol} @ ${xGain.toFixed(2)}x | PnL: ${pnlSol > 0 ? "+" : ""}${pnlSol.toFixed(4)} SOL`);
   }
   return { xGain, pnlSol };
 }
@@ -764,19 +765,32 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker v13 - Paper Trading Mode");
+  log("KOL Tracker v14 - Full System");
+
+  // Initialize all modules
+  const db = brain.loadDB();
+  commands.init(bot, CHAT_ID);
+  weeklyReport.init(bot);
+
+  log(`Brain loaded: ${db.stats.totalTrades} trades in database`);
+  log(`Security: authorized chat ${CHAT_ID}`);
+  log(`Commands: all Telegram commands active`);
+  log(`Weekly report: daily 8am UTC scheduled`);
 
   await bot.sendMessage(CHAT_ID,
-    `KOL Tracker Bot v13 Online\n\n` +
-    `📝 PAPER TRADING MODE: ${PAPER_TRADING ? "ON" : "OFF"}\n` +
-    `Starting Capital: ${PAPER_CAPITAL_SOL} SOL\n` +
-    `Trade Size: ${PAPER_TRADE_SIZE_SOL} SOL per trade\n` +
+    `KOL Tracker Bot v14 Online\n\n` +
+    `Full System Active\n\n` +
+    `PAPER TRADING: ${PAPER_TRADING ? "ON" : "OFF"}\n` +
+    `Capital: ${PAPER_CAPITAL_SOL} SOL\n` +
+    `Trade Size: ${PAPER_TRADE_SIZE_SOL} SOL\n` +
     `TP1: 25% at 2x | TP2: 50% at 3x\n` +
     `Stop Loss: -50%\n\n` +
-    `All signals auto-tracked as paper trades\n` +
-    `Tap Stats to see paper trading results\n\n` +
-    `Run for 1-2 weeks to find best signal type\n` +
-    `Then go live with real capital!`
+    `Modules Active:\n` +
+    `- Brain: learning database\n` +
+    `- Security: only you control bot\n` +
+    `- Commands: /help to see all\n` +
+    `- Weekly report: 8am UTC daily\n\n` +
+    `Type /help for all commands`
   );
 
   await scan();
