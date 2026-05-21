@@ -272,7 +272,6 @@ function signalLabel(score) {
 }
 
 // ─── CLAUDE AI FILTER (COST OPTIMIZED) ───────────────────────────────────────
-const claudeCache = new Map();
 let claudeCallCount = 0;
 const CLAUDE_DAILY_LIMIT = 50; // max 50 calls per day to control cost
 
