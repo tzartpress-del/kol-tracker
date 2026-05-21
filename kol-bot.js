@@ -31,6 +31,7 @@ const ULTRA_MIN_BUY_RATIO = 2;
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const globalAlerted = new Set();
 const alerted = new Map();
 const claudeCache = new Map();
 const performanceTracker = new Map();
@@ -59,13 +60,23 @@ bot.on("callback_query", async (query) => {
     if (query.data === "stats") {
       await bot.answerCallbackQuery(query.id);
       const s = botStats;
-      const msg =
-        `📊 Bot Performance Stats\n\n` +
-        `KOL: ${s.kol.alerts} alerts | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n` +
-        `Pump: ${s.pump.alerts} alerts | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n` +
-        `Ultra: ${s.ultra.alerts} alerts | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n\n` +
-        `Tracking: ${performanceTracker.size} tokens`;
-      await bot.sendMessage(CHAT_ID, msg);
+      const kolWR = s.kol.alerts > 0 ? ((s.kol.hits2x/s.kol.alerts)*100).toFixed(0) : 0;
+      const pumpWR = s.pump.alerts > 0 ? ((s.pump.hits2x/s.pump.alerts)*100).toFixed(0) : 0;
+      const ultraWR = s.ultra.alerts > 0 ? ((s.ultra.hits2x/s.ultra.alerts)*100).toFixed(0) : 0;
+      await bot.sendMessage(CHAT_ID,
+        `📊 *Bot Performance Stats*\n\n` +
+        `🚨 KOL Signals\n` +
+        `Alerts: ${s.kol.alerts} | 2x: ${s.kol.hits2x} | 5x: ${s.kol.hits5x} | 10x: ${s.kol.hits10x}\n` +
+        `Win Rate: ${kolWR}%\n\n` +
+        `🎯 PumpFun Pre-Bond\n` +
+        `Alerts: ${s.pump.alerts} | 2x: ${s.pump.hits2x} | 5x: ${s.pump.hits5x} | 10x: ${s.pump.hits10x}\n` +
+        `Win Rate: ${pumpWR}%\n\n` +
+        `🚀 Ultra Early\n` +
+        `Alerts: ${s.ultra.alerts} | 2x: ${s.ultra.hits2x} | 5x: ${s.ultra.hits5x} | 10x: ${s.ultra.hits10x}\n` +
+        `Win Rate: ${ultraWR}%\n\n` +
+        `Blacklisted: ${blacklist.size} | Tracking: ${performanceTracker.size}`,
+        { parse_mode: "Markdown" }
+      );
     }
   } catch(e) {}
 });
@@ -88,53 +99,77 @@ function fmtAge(ts) {
   return `${Math.floor(secs/86400)}d`;
 }
 
-// ─── HARD FILTER ─────────────────────────────────────────────────────────────
+// ─── HARD FILTER (ChatGPT recommended) ───────────────────────────────────────
 function hardFilter(token) {
   const holders = token.holder_count || 0;
   const liq = token.liquidity || 0;
-  const rug = token.rug_ratio || 0;
-  const bundle = token.bundler_trader_amount_rate || 0;
+  const rug = token.rug_ratio || 0;         // FIX: default 0 not 1
+  const bundle = token.bundler_trader_amount_rate || 0; // FIX: default 0 not 1
   const smart = token.smart_degen_count || 0;
-  if (holders < 30) return false;
-  if (liq < 5000) return false;
-  if (rug > 0.25) return false;
-  if (bundle > 0.40) return false;
+  const top10 = token.top_10_holder_rate || 0;
+  const antiFarm = holders > 500 && (token.volume || 0) < 10000;
+
+  if (holders < 40) return false;
+  if (liq < 7000) return false;
+  if (rug > 0.18) return false;
+  if (bundle > 0.25) return false;
   if (smart === 0) return false;
+  if (top10 > 0.35) return false;   // holder distribution filter
+  if (antiFarm) return false;        // anti-farm detection
   if (blacklist.has(token.creator || "")) return false;
   return true;
 }
 
-// ─── SIGNAL SCORE ─────────────────────────────────────────────────────────────
-function signalScore(t) {
+// ─── VELOCITY SCORING ────────────────────────────────────────────────────────
+function getVelocity(token) {
+  const vol5m = token.volume_5m || 0;
+  const vol1h = token.volume || 0;
+  return parseFloat((vol1h > 0 ? (vol5m * 12) / vol1h : 0).toFixed(2));
+}
+
+function velocityLabel(v) {
+  if (v >= 2.0) return "🔥 EXPLOSIVE";
+  if (v >= 1.0) return "✅ STABLE";
+  if (v < 0.5) return "💀 DYING";
+  return "🟡 MODERATE";
+}
+
+// ─── FINAL SCORE (ChatGPT scoring system) ────────────────────────────────────
+function calcFinalScore(token, aiConfidence, insiderCount) {
   let s = 0;
-  const smart = t.smart_degen_count || 0;
-  const kol = t.renowned_count || 0;
-  const rug = t.rug_ratio || 0;
-  if (smart >= 3) s += 3; else if (smart >= 2) s += 2; else if (smart >= 1) s += 1;
+  const smart = token.smart_degen_count || 0;
+  const kol = token.renowned_count || 0;
+  const rug = token.rug_ratio || 0;
+  const liq = token.liquidity || 0;
+  const buys = token.buy_5m || token.swaps_5m || 0;
+  const sells = token.sell_5m || 0;
+
+  if (smart >= 3) s += 3; else if (smart >= 1) s += 2;
   if (kol >= 2) s += 2; else if (kol >= 1) s += 1;
-  if (rug < 0.1) s += 2; else if (rug < 0.2) s += 1;
-  if (t.renounced_mint === 1) s += 1;
-  if (t.renounced_freeze_account === 1) s += 1;
-  if (!t.is_wash_trading) s += 1;
+  if (liq > 15000) s += 2;
+  if (buys > sells * 1.5) s += 2;
+  if (token.creator_token_status === "hold") s += 1;
+  if (token.renounced_mint === 1) s += 1;
+  if (token.is_wash_trading) s -= 3;
+  if (rug > 0.20) s -= 3;
+  if ((token.bundler_trader_amount_rate || 0) > 0.25) s -= 2;
+  if ((token.holder_count || 0) < 50) s -= 2;
+  if (liq < 8000) s -= 2;
+  if (token.creator_token_status === "sell") s -= 2;
+  s += Math.floor(aiConfidence / 20);
+  if (getVelocity(token) >= 1.5) s += 1;
+  s += insiderCount;
   return s;
 }
 
 function signalLabel(score) {
-  if (score >= 8) return "ULTRA HIGH";
-  if (score >= 6) return "HIGH";
-  if (score >= 4) return "MEDIUM";
-  return "LOW";
+  if (score >= 12) return "🔥 ULTRA HIGH";
+  if (score >= 8) return "⚡ HIGH";
+  if (score >= 5) return "✅ MEDIUM";
+  return "🟡 LOW";
 }
 
-// ─── VELOCITY ────────────────────────────────────────────────────────────────
-function getVelocity(token) {
-  const vol5m = token.volume_5m || 0;
-  const vol1h = token.volume || 0;
-  const v = vol1h > 0 ? (vol5m * 12) / vol1h : 0;
-  return parseFloat(v.toFixed(2));
-}
-
-// ─── CLAUDE FILTER ───────────────────────────────────────────────────────────
+// ─── CLAUDE AI FILTER ────────────────────────────────────────────────────────
 async function claudeFilter(token) {
   const cached = claudeCache.get(token.address);
   if (cached && Date.now() - cached.ts < 7200000) return cached.result;
@@ -224,14 +259,20 @@ async function pollInsiderWallets() {
   }
 }
 
-// ─── PERFORMANCE TRACKER ─────────────────────────────────────────────────────
+// ─── PERFORMANCE TRACKER WITH MILESTONES ─────────────────────────────────────
 async function getTokenPrice(mint) {
   try {
     const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`);
     const pairs = (res.data?.pairs || []).filter(p => p.chainId === "solana");
     if (!pairs.length) return null;
     pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0));
-    return { price: parseFloat(pairs[0].priceUsd||0), mc: pairs[0].fdv||0, liquidity: pairs[0].liquidity?.usd||0 };
+    return {
+      price: parseFloat(pairs[0].priceUsd||0),
+      mc: pairs[0].fdv||0,
+      liquidity: pairs[0].liquidity?.usd||0,
+      sells: pairs[0].txns?.h1?.sells||0,
+      buys: pairs[0].txns?.h1?.buys||0,
+    };
   } catch(e) { return null; }
 }
 
@@ -242,54 +283,68 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
   const interval = setInterval(async () => {
     const tracker = performanceTracker.get(mint);
     if (!tracker) { clearInterval(interval); return; }
+
+    // 24hr final report
     if (Date.now() - tracker.alertTime > 86400000) {
       const verdict = tracker.peakX >= 10 ? "🌙 MOONSHOT" : tracker.peakX >= 5 ? "🔥 BANGER" : tracker.peakX >= 2 ? "✅ WIN" : tracker.peakX >= 1 ? "🟡 BREAKEVEN" : "🔴 RUG";
       await bot.sendMessage(CHAT_ID,
         `📋 *24hr Final Report*\n\n` +
         `*$${symbol}*\n` +
-        `├ Peak gain: *${tracker.peakX.toFixed(2)}x*\n` +
-        `└ Verdict: ${verdict}\n\n` +
-        `Signal type: ${signalType.toUpperCase()}`,
+        `├ Peak: *${tracker.peakX.toFixed(2)}x*\n` +
+        `└ Verdict: ${verdict}`,
         { parse_mode: "Markdown" }
       ).catch(()=>{});
       performanceTracker.delete(mint);
       clearInterval(interval);
       return;
     }
+
     const current = await getTokenPrice(mint);
     if (!current?.price || !alertPrice) return;
     const xGain = current.price / alertPrice;
     if (xGain > tracker.peakX) tracker.peakX = xGain;
 
+    // Distribution warning
+    if (current.sells > current.buys * 2 && xGain > 1.5 && !tracker.notifiedDistribution) {
+      tracker.notifiedDistribution = true;
+      await bot.sendMessage(CHAT_ID,
+        `⚠️ *DISTRIBUTION DETECTED*\n\n` +
+        `*$${symbol}* — Large sell pressure!\n` +
+        `Current: ${xGain.toFixed(2)}x\n` +
+        `Consider exiting!`,
+        { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
+      ).catch(()=>{});
+    }
+
+    // Milestone alerts
     if (xGain >= 10 && !tracker.notified10x) {
       tracker.notified10x = true; stats.hits10x++;
       await bot.sendMessage(CHAT_ID,
         `🌙🌙🌙 *10x MILESTONE!* 🌙🌙🌙\n\n` +
-        `*$${symbol}* is up *${xGain.toFixed(2)}x* from alert!\n\n` +
+        `*$${symbol}* is up *${xGain.toFixed(2)}x*!\n\n` +
         `├ Alert MC: ${fmt(alertMC)}\n` +
         `├ Current MC: ${fmt(current.mc)}\n` +
         `└ Liquidity: ${fmt(current.liquidity)}\n\n` +
         `🏆 MOONSHOT CONFIRMED!\n` +
-        `Consider taking significant profit!`,
+        `Take significant profit!`,
         { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
       ).catch(()=>{});
     } else if (xGain >= 5 && !tracker.notified5x) {
       tracker.notified5x = true; stats.hits5x++;
       await bot.sendMessage(CHAT_ID,
         `🚀🚀 *5x MILESTONE!* 🚀🚀\n\n` +
-        `*$${symbol}* is up *${xGain.toFixed(2)}x* from alert!\n\n` +
+        `*$${symbol}* is up *${xGain.toFixed(2)}x*!\n\n` +
         `├ Alert MC: ${fmt(alertMC)}\n` +
         `├ Current MC: ${fmt(current.mc)}\n` +
         `└ Liquidity: ${fmt(current.liquidity)}\n\n` +
-        `🔥 BANGER ALERT!\n` +
-        `Consider taking 25-50% profit!`,
+        `🔥 BANGER! Consider 25-50% profit!`,
         { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
       ).catch(()=>{});
     } else if (xGain >= 2 && !tracker.notified2x) {
       tracker.notified2x = true; stats.hits2x++;
       await bot.sendMessage(CHAT_ID,
         `✅ *2x MILESTONE!* ✅\n\n` +
-        `*$${symbol}* is up *${xGain.toFixed(2)}x* from alert!\n\n` +
+        `*$${symbol}* is up *${xGain.toFixed(2)}x*!\n\n` +
         `├ Alert MC: ${fmt(alertMC)}\n` +
         `├ Current MC: ${fmt(current.mc)}\n` +
         `└ Liquidity: ${fmt(current.liquidity)}\n\n` +
@@ -298,15 +353,18 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
         { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
       ).catch(()=>{});
     }
+
+    // Liquidity warning
     if (current.liquidity < 2000 && tracker.peakX > 1.5) {
       await bot.sendMessage(CHAT_ID,
         `⚠️ *LIQUIDITY WARNING!* ⚠️\n\n` +
-        `*$${symbol}* liquidity dropping fast!\n` +
+        `*$${symbol}* liq dropping!\n` +
         `└ Liq: ${fmt(current.liquidity)}\n\n` +
-        `🚨 Consider exiting now!`,
+        `🚨 Exit now!`,
         { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
       ).catch(()=>{});
-      performanceTracker.delete(mint); clearInterval(interval);
+      performanceTracker.delete(mint);
+      clearInterval(interval);
     }
   }, 3 * 60 * 1000);
 }
@@ -340,7 +398,7 @@ async function getKOLSignals() {
     if (r.status !== "fulfilled" || !r.value) continue;
     const tokens = r.value?.data?.rank || [];
     for (const t of tokens) {
-      if (!t.address || seen.has(t.address)) continue;
+      if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
       seen.add(t.address);
       const mc = t.market_cap || 0;
       const tokenAge = t.open_timestamp ? (Date.now() - t.open_timestamp * 1000) : null;
@@ -368,7 +426,7 @@ async function getPumpFunPrebond() {
     const tokens = r.value?.data?.rank || r.value?.data?.token_list || r.value?.data || [];
     if (!Array.isArray(tokens)) continue;
     for (const t of tokens) {
-      if (!t.address || seen.has(t.address)) continue;
+      if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
       seen.add(t.address);
       const progress = t.launchpad_status?.bonding_curve_percentage || t.graduation_progress || t.progress || 0;
       const volume = t.volume || t.volume_24h || 0;
@@ -395,7 +453,7 @@ async function getUltraEarlyLaunches() {
     const tokens = r.value?.data?.rank || r.value?.data?.token_list || r.value?.data || [];
     if (!Array.isArray(tokens)) continue;
     for (const t of tokens) {
-      if (!t.address || seen.has(t.address)) continue;
+      if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
       seen.add(t.address);
       const ageMs = t.open_timestamp ? Date.now() - t.open_timestamp * 1000 : null;
       if (!ageMs || ageMs > ULTRA_MAX_AGE_MS) continue;
@@ -444,22 +502,23 @@ async function sendKOLAlert(token, aiResult) {
   const liq = fmt(token.liquidity || 0);
   const change1h = token.price_change_percent1h || 0;
   const vel = getVelocity(token);
-  const score = signalScore(token);
-  const label = signalLabel(score);
+  const velLabel = velocityLabel(vel);
+  const insiders = Object.keys(insiderBuys[mint] || {});
+  const insiderCount = insiders.length;
+  const insiderBoost = insiderCount >= 3 ? "🔥 INSIDER CONVERGENCE" : insiderCount >= 2 ? "Multi-insider" : insiderCount === 1 ? "Insider buy" : "";
+  const finalScore = calcFinalScore(token, aiResult.confidence, insiderCount);
+  const label = signalLabel(finalScore);
   const isReentry = token.alertType === "REENTRY";
   const riskEmoji = aiResult.risk === "LOW" ? "🟢" : aiResult.risk === "MEDIUM" ? "🟡" : "🔴";
-  const devStatus = token.creator_token_status === "sell" ? "Sold" : token.creator_token_status === "hold" ? "Holding" : "N/A";
-  const mintR = token.renounced_mint === 1 ? "Yes" : "No";
+  const devStatus = token.creator_token_status === "sell" ? "🔴 Sold" : token.creator_token_status === "hold" ? "🟢 Holding" : "🟡 N/A";
+  const mintR = token.renounced_mint === 1 ? "🟢 Yes" : "🔴 No";
   const rugPct = `${((token.rug_ratio||0)*100).toFixed(0)}%`;
-  const smartCount = token.smart_degen_count || 0;
-  const kolCount = token.renowned_count || 0;
-  const insiders = Object.keys(insiderBuys[mint] || {});
-  const insiderStr = insiders.length > 0 ? `\nInsiders: ${insiders.join(", ")}` : "";
-  const netflow = (token.buy_5m||0) > (token.sell_5m||0) ? "Accumulating" : "Selling";
+  const netflow = (token.buy_5m||0) > (token.sell_5m||0) ? "🟢 Accumulating" : "🔴 Selling";
+  const insiderStr = insiders.length > 0 ? `\n└ ${insiders.join(", ")}${insiderBoost ? " — " + insiderBoost : ""}` : "";
 
   const msg =
-    `🚨 *${isReentry ? "REENTRY" : "KOL"} SIGNAL* - ${label}\n` +
-    `Score: ${score}/11 | AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
+    `🚨 *${isReentry ? "REENTRY" : "KOL"} SIGNAL* — ${label}\n` +
+    `Score: ${finalScore} | AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
     `└ ⏱ ${age} | 👁 ${holders} holders\n\n` +
@@ -469,22 +528,22 @@ async function sendKOLAlert(token, aiResult) {
     `├ Vol 1h:  ${vol}\n` +
     `├ Liq:     ${liq}\n` +
     `├ 1h Chg:  ${change1h > 0 ? "+" : ""}${change1h.toFixed(1)}%\n` +
-    `└ Velocity: ${vel}x\n\n` +
+    `└ Velocity: ${vel}x ${velLabel}\n\n` +
     `🧠 *Smart Signals*\n` +
-    `├ Smart Money: ${smartCount} 🤖\n` +
-    `├ KOL Holders: ${kolCount} 👑\n` +
+    `├ Smart Money: ${token.smart_degen_count||0} 🤖\n` +
+    `├ KOL Holders: ${token.renowned_count||0} 👑\n` +
     `└ Netflow: ${netflow}${insiderStr}\n\n` +
     `🔒 *Security*\n` +
-    `├ Dev: ${devStatus}\n` +
-    `├ Mint Rncd: ${mintR}\n` +
-    `└ Rug: ${rugPct}\n\n` +
+    `├ Dev:        ${devStatus}\n` +
+    `├ Mint Rncd:  ${mintR}\n` +
+    `└ Rug:        ${rugPct}\n\n` +
     `💰 *Snipe 0.1 SOL?*`;
 
   const sent = await bot.sendMessage(CHAT_ID, msg, { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: buildKeyboard(mint, false) });
   const alertPrice = token.price ? parseFloat(token.price) : null;
   if (alertPrice) await trackPerformance(mint, alertPrice, mc, symbol, sent.message_id, "kol");
   botStats.kol.alerts++;
-  log(`KOL: $${symbol} Score:${score} Smart:${smartCount} KOL:${kolCount} MC:${fmt(mc)}`);
+  log(`KOL: $${symbol} Score:${finalScore} Smart:${token.smart_degen_count||0} KOL:${token.renowned_count||0} MC:${fmt(mc)}`);
 }
 
 // ─── SEND PUMP ALERT ─────────────────────────────────────────────────────────
@@ -498,11 +557,11 @@ async function sendPumpAlert(token, aiResult) {
   const mc = fmt(token.market_cap || token.usd_market_cap || 0);
   const price = token.price ? `$${parseFloat(token.price).toExponential(4)}` : "N/A";
   const age = fmtAge(token.open_timestamp ? token.open_timestamp*1000 : null);
-  const urgency = progress >= 90 ? "MIGRATING SOON" : progress >= 75 ? "FILLING FAST" : "EARLY";
+  const urgency = progress >= 90 ? "🔴 MIGRATING SOON" : progress >= 75 ? "🟡 FILLING FAST" : "🟢 EARLY";
   const riskEmoji = aiResult.risk === "LOW" ? "🟢" : aiResult.risk === "MEDIUM" ? "🟡" : "🔴";
 
   const msg =
-    `🎯 *PUMPFUN PRE-BOND* - ${urgency}\n` +
+    `🎯 *PUMPFUN PRE-BOND* — ${urgency}\n` +
     `AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
@@ -541,12 +600,12 @@ async function sendUltraEarlyAlert(token, aiResult) {
   const sells = token.sells || 0;
   const buyRatio = token.buyRatio ? token.buyRatio.toFixed(1) : "N/A";
   const vel = getVelocity(token);
-  const momentum = token.buyRatio >= 10 ? "INSANE" : token.buyRatio >= 5 ? "VERY HIGH" : "HIGH";
+  const momentum = token.buyRatio >= 10 ? "🔥🔥🔥 INSANE" : token.buyRatio >= 5 ? "🔥🔥 VERY HIGH" : "🔥 HIGH";
   const riskEmoji = aiResult.risk === "LOW" ? "🟢" : aiResult.risk === "MEDIUM" ? "🟡" : "🔴";
-  const devStatus = token.creator_token_status === "sell" ? "Sold" : token.creator_token_status === "hold" ? "Holding" : "N/A";
+  const devStatus = token.creator_token_status === "sell" ? "🔴 Sold" : token.creator_token_status === "hold" ? "🟢 Holding" : "🟡 N/A";
 
   const msg =
-    `🚀 *ULTRA EARLY* - ${momentum} MOMENTUM\n` +
+    `🚀 *ULTRA EARLY LAUNCH* — ${momentum}\n` +
     `AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
@@ -589,7 +648,7 @@ async function scan() {
     ...pumpTokens.map(t => ({ ...t, _type: "pump" })),
   ];
 
-  // Hard filter KOL tokens only
+  // Hard filter KOL only (ultra/pump have own filters)
   const filtered = allTokens.filter(t => t._type !== "kol" || hardFilter(t));
 
   // Run Claude in parallel
@@ -597,17 +656,23 @@ async function scan() {
 
   // Score and sort
   const scored = filtered
-    .map((t, i) => ({ ...t, _ai: aiResults[i], _score: signalScore(t) }))
+    .map((t, i) => {
+      const insiderCount = Object.keys(insiderBuys[t.address] || {}).length;
+      return { ...t, _ai: aiResults[i], _finalScore: calcFinalScore(t, aiResults[i].confidence, insiderCount) };
+    })
     .filter((t, i) => aiResults[i]?.decision !== "REJECT")
-    .sort((a,b) => b._score - a._score);
+    .sort((a,b) => b._finalScore - a._finalScore);
 
   // Send top 5
   let sent = 0;
   for (const token of scored) {
     if (sent >= 5) break;
     const mint = token.address;
+    if (globalAlerted.has(mint)) continue;
     const lastAlert = alerted.get(mint);
     if (lastAlert && Date.now() - lastAlert < ALERT_COOLDOWN_MS) continue;
+
+    globalAlerted.add(mint);
     alerted.set(mint, Date.now());
 
     try {
@@ -619,10 +684,11 @@ async function scan() {
     await new Promise(r => setTimeout(r, 1500));
   }
 
-  // Clean old cooldowns
+  // Cleanup
   const now = Date.now();
-  for (const [mint, ts] of alerted.entries()) {
-    if (now - ts > ALERT_COOLDOWN_MS) alerted.delete(mint);
+  for (const mint of globalAlerted) {
+    const ts = alerted.get(mint);
+    if (!ts || now - ts > ALERT_COOLDOWN_MS) globalAlerted.delete(mint);
   }
   for (const [k, v] of claudeCache.entries()) {
     if (now - v.ts > 7200000) claudeCache.delete(k);
@@ -631,17 +697,22 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker v12 Clean - Starting");
+  log("KOL Tracker - Final Version");
 
   await bot.sendMessage(CHAT_ID,
-    `🟢 KOL Tracker v12 Online\n\n` +
-    `Dual Alert System\n` +
-    `- KOL Signal Alerts\n` +
-    `- PumpFun Pre-Bond\n` +
-    `- Ultra Early Launches\n\n` +
-    `Milestone tracking: 2x 5x 10x\n` +
-    `Trojan buy button on every alert\n` +
-    `Scan every 20s`
+    `🟢 *KOL Tracker Online*\n\n` +
+    `✅ All ChatGPT improvements included\n` +
+    `✅ Hard filter + top10 holder check\n` +
+    `✅ Anti-farm detection\n` +
+    `✅ Velocity scoring\n` +
+    `✅ Final score ranking\n` +
+    `✅ Insider convergence\n` +
+    `✅ Distribution warnings\n` +
+    `✅ Milestone alerts 2x 5x 10x\n` +
+    `✅ Tap-to-copy contracts\n` +
+    `✅ Claude AI 50 calls/day limit\n\n` +
+    `Scan every 20s`,
+    { parse_mode: "Markdown" }
   );
 
   await scan();
