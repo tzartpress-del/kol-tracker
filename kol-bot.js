@@ -1,11 +1,12 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 
-// ─── MODULE IMPORTS ───────────────────────────────────────────────────────────
-const brain = require("./brain");
-const security = require("./security");
-const commands = require("./commands");
-const weeklyReport = require("./weekly-report");
+// ─── MODULE IMPORTS (safe — bot runs even if modules fail) ────────────────────
+let brain, security, commands, weeklyReport;
+try { brain = require("./brain"); } catch(e) { console.log("brain.js not loaded:", e.message); }
+try { security = require("./security"); } catch(e) { console.log("security.js not loaded:", e.message); }
+try { commands = require("./commands"); } catch(e) { console.log("commands.js not loaded:", e.message); }
+try { weeklyReport = require("./weekly-report"); } catch(e) { console.log("weekly-report.js not loaded:", e.message); }
 
 // ─── PRODUCTION STABILITY ────────────────────────────────────────────────────
 process.on("unhandledRejection", console.error);
@@ -767,15 +768,10 @@ async function scan() {
 async function main() {
   log("KOL Tracker v14 - Full System");
 
-  // Initialize all modules
-  const db = brain.loadDB();
-  commands.init(bot, CHAT_ID);
-  weeklyReport.init(bot);
-
-  log(`Brain loaded: ${db.stats.totalTrades} trades in database`);
-  log(`Security: authorized chat ${CHAT_ID}`);
-  log(`Commands: all Telegram commands active`);
-  log(`Weekly report: daily 8am UTC scheduled`);
+  // Initialize all modules safely
+  try { if (brain) { const db = brain.loadDB(); log(`Brain: ${db.stats.totalTrades} trades loaded`); } } catch(e) { log(`Brain init error: ${e.message}`); }
+  try { if (commands) commands.init(bot, CHAT_ID); log("Commands: active"); } catch(e) { log(`Commands init error: ${e.message}`); }
+  try { if (weeklyReport) weeklyReport.init(bot); log("Weekly report: scheduled"); } catch(e) { log(`Weekly report init error: ${e.message}`); }
 
   await bot.sendMessage(CHAT_ID,
     `KOL Tracker Bot v14 Online\n\n` +
