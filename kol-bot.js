@@ -99,23 +99,23 @@ function fmtAge(ts) {
   return `${Math.floor(secs/86400)}d`;
 }
 
-// ─── HARD FILTER (ChatGPT recommended) ───────────────────────────────────────
+// ─── HARD FILTER ─────────────────────────────────────────────────────────────
 function hardFilter(token) {
   const holders = token.holder_count || 0;
   const liq = token.liquidity || 0;
-  const rug = token.rug_ratio || 0;         // FIX: default 0 not 1
-  const bundle = token.bundler_trader_amount_rate || 0; // FIX: default 0 not 1
+  const rug = token.rug_ratio || 0;         // default 0 not 1
+  const bundle = token.bundler_trader_amount_rate || 0; // default 0 not 1
   const smart = token.smart_degen_count || 0;
   const top10 = token.top_10_holder_rate || 0;
   const antiFarm = holders > 500 && (token.volume || 0) < 10000;
 
-  if (holders < 40) return false;
-  if (liq < 7000) return false;
-  if (rug > 0.18) return false;
-  if (bundle > 0.25) return false;
+  if (holders < 30) return false;       // loosened from 40
+  if (liq < 5000) return false;         // loosened from 7000
+  if (rug > 0.25) return false;         // loosened from 0.18
+  if (bundle > 0.40) return false;      // loosened from 0.25
   if (smart === 0) return false;
-  if (top10 > 0.35) return false;   // holder distribution filter
-  if (antiFarm) return false;        // anti-farm detection
+  if (top10 > 0.45) return false;       // loosened from 0.35
+  if (antiFarm) return false;
   if (blacklist.has(token.creator || "")) return false;
   return true;
 }
