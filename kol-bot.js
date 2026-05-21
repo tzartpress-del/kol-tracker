@@ -1,8 +1,14 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
+const http  = require("http");
+const https = require("https");
+const dns   = require("dns");
 
 process.on("unhandledRejection", console.error);
 process.on("uncaughtException", console.error);
+
+// Force IPv4 globally
+dns.setDefaultResultOrder("ipv4first");
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
@@ -13,14 +19,20 @@ const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 // ─── FILTERS ─────────────────────────────────────────────────────────────────
 const MC_MIN             = 15000;
 const MC_MAX             = 150000;
-const POLL_INTERVAL_MS   = 45000;
+const POLL_INTERVAL_MS   = 90000;  // 90s — safer polling
 const ALERT_COOLDOWN_MS  = 3600000;
-const MAX_AGE_MS         = 24 * 60 * 60 * 1000; // 24 hours
-const REENTRY_MIN_VEL    = 1.5;   // velocity threshold for old tokens
-const REENTRY_MIN_VOL    = 50000; // volume threshold for old tokens
+const MAX_AGE_MS         = 24 * 60 * 60 * 1000;
+const REENTRY_MIN_VEL    = 1.5;
+const REENTRY_MIN_VOL    = 50000;
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
-const bot                = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const bot = new TelegramBot(TELEGRAM_TOKEN, {
+  polling: {
+    interval: 300,
+    autoStart: true,
+    params: { timeout: 10 },
+  },
+});
 const alerted            = new Map();
 const performanceTracker = new Map();
 const insiderBuys        = {};
@@ -121,16 +133,20 @@ function signalLabel(score) {
   return "🟡 LOW";
 }
 
-// ─── GMGN API FETCH (IPv4 forced via DNS, 1 req/sec) ─────────────────────────
-const http  = require("http");
-const https = require("https");
-const dns   = require("dns");
+// ─── GMGN API FETCH (SAFE VERSION) ───────────────────────────────────────────
+const ipv4Agent = new https.Agent({ family: 4, keepAlive: true });
 
-// Force IPv4 DNS resolution globally
-dns.setDefaultResultOrder("ipv4first");
-
-// Create HTTPS agent that only uses IPv4
-const ipv4Agent = new https.Agent({ family: 4 });
+const axiosInstance = axios.create({
+  httpsAgent: ipv4Agent,
+  timeout: 20000,
+  maxRedirects: 2,
+  validateStatus: () => true,
+  headers: {
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json",
+    "Referer": "https://gmgn.ai/",
+  },
+});
 
 async function fetchGMGN(path) {
   const now  = Date.now();
@@ -139,26 +155,29 @@ async function fetchGMGN(path) {
   lastGMGNCall = Date.now();
 
   try {
-    const res = await axios.get(`https://gmgn.ai${path}`, {
-      headers: {
-        "x-api-key":  GMGN_API_KEY || "",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Accept":     "application/json",
-        "Referer":    "https://gmgn.ai/",
-      },
-      httpsAgent: ipv4Agent,
-      timeout: 12000,
-    });
+    const res = await axiosInstance.get(
+      `https://gmgn.ai${path}`,
+      { headers: { "x-api-key": GMGN_API_KEY || "" } }
+    );
+
+    if (res.status !== 200) {
+      log(`GMGN bad status: ${res.status}`);
+      return null;
+    }
+    if (typeof res.data === "string") {
+      log("GMGN returned HTML instead of JSON");
+      return null;
+    }
     return res.data;
   } catch(e) {
     const status = e.response?.status;
     if (status === 429) {
-      log(`GMGN rate limit — waiting 10s`);
+      log("GMGN rate limited — waiting 10s");
       await new Promise(r => setTimeout(r, 10000));
     } else if (status === 403) {
-      log(`GMGN 403 — IP blocked or API key invalid`);
+      log("GMGN 403 — blocked");
     } else if (status === 404) {
-      log(`GMGN 404 — endpoint not found`);
+      log("GMGN endpoint missing");
     } else {
       log(`GMGN error: ${e.message}`);
     }
@@ -210,16 +229,20 @@ async function pollInsiderWallets() {
 }
 
 // ─── DYNAMIC SMART MONEY TRACKING ────────────────────────────────────────────
-// Fetches top active smart money wallets from GMGN every scan
-// Groups by token — finds cluster signals (3+ wallets buying same token)
-const smartMoneyBuys = {}; // mint -> { wallets: Set, lastSeen: timestamp }
+const smartMoneyBuys = {};
 
 async function fetchSmartMoneyActivity() {
   try {
-    const data = await fetchGMGN(`/api/v1/user/smartmoney?chain=sol&limit=100`);
-    const trades = data?.data?.list || data?.list || [];
-    if (!trades.length) {
-      log(`Smart money: no trades returned`);
+    const data = await fetchGMGN(`/defi/quotation/v1/smartmoney/sol?limit=100`);
+
+    if (!data || typeof data !== "object") {
+      log("Smart money: invalid response");
+      return;
+    }
+
+    const trades = data?.data?.list || [];
+    if (!Array.isArray(trades) || !trades.length) {
+      log("Smart money: no trades");
       return;
     }
 
@@ -227,40 +250,39 @@ async function fetchSmartMoneyActivity() {
     const now = Date.now();
 
     for (const trade of trades) {
-      if (trade.side !== "buy") continue;
-      const mint = trade.base_address;
+      const mint = trade.address || trade.base_address;
       if (!mint) continue;
 
       if (!smartMoneyBuys[mint]) {
         smartMoneyBuys[mint] = {
-          symbol:   trade.base_token?.symbol || "???",
+          symbol:   trade.symbol || trade.base_token?.symbol || "???",
           wallets:  new Set(),
           amounts:  [],
           lastSeen: now,
         };
       }
-      smartMoneyBuys[mint].wallets.add(trade.maker);
+      smartMoneyBuys[mint].wallets.add(trade.wallet || trade.maker || "unknown");
       smartMoneyBuys[mint].amounts.push(trade.amount_usd || 0);
       smartMoneyBuys[mint].lastSeen = now;
     }
 
     // Cleanup entries older than 30 mins
     const cutoff = now - 1800000;
-    for (const [mint, data] of Object.entries(smartMoneyBuys)) {
-      if (data.lastSeen < cutoff) delete smartMoneyBuys[mint];
+    for (const [mint, d] of Object.entries(smartMoneyBuys)) {
+      if (d.lastSeen < cutoff) delete smartMoneyBuys[mint];
     }
 
-    // Check for cluster signals (3+ wallets buying same token)
-    for (const [mint, data] of Object.entries(smartMoneyBuys)) {
-      if (data.wallets.size >= 3 && !alerted.has(`cluster_${mint}`)) {
+    // Cluster signal — 3+ wallets buying same token
+    for (const [mint, d] of Object.entries(smartMoneyBuys)) {
+      if (d.wallets.size >= 3 && !alerted.has(`cluster_${mint}`)) {
         alerted.set(`cluster_${mint}`, Date.now());
-        const totalUsd = data.amounts.reduce((a, b) => a + b, 0);
-        log(`CLUSTER SIGNAL: $${data.symbol} — ${data.wallets.size} smart money wallets — $${totalUsd.toFixed(0)}`);
-        await sendClusterAlert(mint, data.symbol, data.wallets.size, totalUsd);
+        const totalUsd = d.amounts.reduce((a, b) => a + b, 0);
+        log(`CLUSTER SIGNAL: $${d.symbol} — ${d.wallets.size} wallets — $${totalUsd.toFixed(0)}`);
+        await sendClusterAlert(mint, d.symbol, d.wallets.size, totalUsd);
       }
     }
   } catch(e) {
-    log(`Smart money activity error: ${e.message}`);
+    log(`Smart money error: ${e.message}`);
   }
 }
 
@@ -684,7 +706,7 @@ async function scan() {
       else await sendKOLAlert(token);
       sent++;
     } catch(e) { log(`Alert error: ${e.message}`); }
-    await new Promise(r => setTimeout(r, 1500));
+    await new Promise(r => setTimeout(r, 3000)); // safer send delay
   }
 
   // Cleanup old cooldowns
