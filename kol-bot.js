@@ -422,88 +422,215 @@ async function fetchGMGN(url, retries = 3) {
   return null;
 }
 
-// ─── GET KOL SIGNALS ─────────────────────────────────────────────────────────
+// ─── GET KOL SIGNALS VIA DEXSCREENER ────────────────────────────────────────
 async function getKOLSignals() {
-  const urls = [
-    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
-    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
-  ];
-  const responses = await Promise.allSettled(urls.map(u => fetchGMGN(u)));
-  const seen = new Set(); const results = [];
-  for (const r of responses) {
-    if (r.status !== "fulfilled" || !r.value) continue;
-    const tokens = r.value?.data?.rank || [];
+  const results = [];
+  const seen = new Set();
+
+  try {
+    // DexScreener — trending Solana tokens
+    const res = await axios.get(
+      `https://api.dexscreener.com/token-boosts/top/v1`,
+      { timeout: 10000 }
+    );
+    const tokens = res.data || [];
+
     for (const t of tokens) {
-      if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
+      if (t.chainId !== "solana") continue;
+      if (!t.tokenAddress || seen.has(t.tokenAddress)) continue;
+      seen.add(t.tokenAddress);
+
+      // Get full token data
+      const detail = await getTokenDetail(t.tokenAddress);
+      if (!detail) continue;
+
+      const mc = detail.mc || 0;
+      if (mc < MC_MIN || mc > MC_MAX) continue;
+      if (detail.liquidity < 5000) continue;
+
+      results.push({
+        address: t.tokenAddress,
+        symbol: detail.symbol,
+        market_cap: mc,
+        liquidity: detail.liquidity,
+        volume: detail.volume1h,
+        price: detail.price,
+        price_change_percent1h: detail.change1h,
+        holder_count: detail.txns,
+        smart_degen_count: detail.buys > detail.sells * 1.5 ? 2 : 1,
+        renowned_count: t.totalAmount > 500 ? 2 : 1,
+        rug_ratio: 0,
+        is_wash_trading: false,
+        renounced_mint: 0,
+        renounced_freeze_account: 0,
+        bundler_trader_amount_rate: 0,
+        creator_token_status: "unknown",
+        open_timestamp: detail.pairCreatedAt ? detail.pairCreatedAt / 1000 : null,
+        buy_5m: detail.buys,
+        sell_5m: detail.sells,
+        alertType: "KOL",
+      });
+
+      if (results.length >= 20) break;
+    }
+  } catch(e) {
+    log(`DexScreener KOL error: ${e.message}`);
+  }
+
+  // Also try GMGN as secondary (may work sometimes)
+  try {
+    const gmgnUrl = `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&limit=100`;
+    const gmgnData = await fetchGMGN(gmgnUrl);
+    const gmgnTokens = gmgnData?.data?.rank || [];
+
+    for (const t of gmgnTokens) {
+      if (!t.address || seen.has(t.address)) continue;
       seen.add(t.address);
       const mc = t.market_cap || 0;
       const tokenAge = t.open_timestamp ? (Date.now() - t.open_timestamp * 1000) : null;
       const isNew = tokenAge !== null && tokenAge <= MAX_TOKEN_AGE_MS;
       const isReentry = !isNew && (t.volume||0) >= REENTRY_MIN_VOLUME && (t.smart_degen_count||0) >= 2;
-      if (mc >= MC_MIN && mc <= MC_MAX && (t.smart_degen_count||0) >= 1 && (t.renowned_count||0) >= 1 && (isNew||isReentry) && !blacklist.has(t.creator||"")) {
+      if (mc >= MC_MIN && mc <= MC_MAX && (t.smart_degen_count||0) >= 1 && (t.renowned_count||0) >= 1 && (isNew||isReentry)) {
         results.push({ ...t, alertType: isReentry ? "REENTRY" : "KOL", tokenAge });
       }
     }
-  }
+  } catch(e) {}
+
   results.sort((a,b) => (b.smart_degen_count||0) - (a.smart_degen_count||0));
   return results;
 }
 
-// ─── GET PUMPFUN PRE-BOND ────────────────────────────────────────────────────
+// ─── GET TOKEN DETAIL FROM DEXSCREENER ───────────────────────────────────────
+async function getTokenDetail(mint) {
+  try {
+    const res = await axios.get(
+      `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
+      { timeout: 8000 }
+    );
+    const pairs = (res.data?.pairs || []).filter(p => p.chainId === "solana");
+    if (!pairs.length) return null;
+    pairs.sort((a,b) => (b.liquidity?.usd||0) - (a.liquidity?.usd||0));
+    const p = pairs[0];
+    return {
+      symbol: p.baseToken?.symbol || "???",
+      mc: p.fdv || p.marketCap || 0,
+      price: parseFloat(p.priceUsd || 0),
+      liquidity: p.liquidity?.usd || 0,
+      volume1h: p.volume?.h1 || 0,
+      change1h: p.priceChange?.h1 || 0,
+      buys: p.txns?.h1?.buys || 0,
+      sells: p.txns?.h1?.sells || 0,
+      txns: (p.txns?.h24?.buys||0) + (p.txns?.h24?.sells||0),
+      pairCreatedAt: p.pairCreatedAt || null,
+    };
+  } catch(e) { return null; }
+}
+
+// ─── GET PUMPFUN PRE-BOND VIA DEXSCREENER ────────────────────────────────────
 async function getPumpFunPrebond() {
-  const urls = [
-    `https://gmgn.ai/defi/quotation/v1/rank/sol/pump?orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`,
-    `https://gmgn.ai/api/v1/mutil_window_token_list/sol?type=near_completion&orderby=volume&direction=desc&limit=50`,
-  ];
-  const responses = await Promise.allSettled(urls.map(u => fetchGMGN(u)));
-  const seen = new Set(); const results = [];
-  for (const r of responses) {
-    if (r.status !== "fulfilled" || !r.value) continue;
-    const tokens = r.value?.data?.rank || r.value?.data?.token_list || r.value?.data || [];
-    if (!Array.isArray(tokens)) continue;
-    for (const t of tokens) {
-      if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
-      seen.add(t.address);
-      const progress = t.launchpad_status?.bonding_curve_percentage || t.graduation_progress || t.progress || 0;
-      const volume = t.volume || t.volume_24h || 0;
-      const holders = t.holder_count || t.holders || 0;
-      if (progress >= PUMP_MIN_PROGRESS && progress <= PUMP_MAX_PROGRESS && volume >= PUMP_MIN_VOLUME && holders >= PUMP_MIN_HOLDERS && (t.rug_ratio||0) < 0.3 && !t.is_wash_trading) {
-        results.push({ ...t, alertType: "PUMP", progress });
+  const results = [];
+  try {
+    // Try GMGN first
+    const urls = [
+      `https://gmgn.ai/defi/quotation/v1/rank/sol/pump?orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`,
+    ];
+    const responses = await Promise.allSettled(urls.map(u => fetchGMGN(u)));
+    const seen = new Set();
+
+    for (const r of responses) {
+      if (r.status !== "fulfilled" || !r.value) continue;
+      const tokens = r.value?.data?.rank || [];
+      for (const t of tokens) {
+        if (!t.address || seen.has(t.address)) continue;
+        seen.add(t.address);
+        const progress = t.launchpad_status?.bonding_curve_percentage || t.graduation_progress || t.progress || 0;
+        const volume = t.volume || t.volume_24h || 0;
+        const holders = t.holder_count || t.holders || 0;
+        if (progress >= PUMP_MIN_PROGRESS && progress <= PUMP_MAX_PROGRESS && volume >= PUMP_MIN_VOLUME && holders >= PUMP_MIN_HOLDERS && (t.rug_ratio||0) < 0.3 && !t.is_wash_trading) {
+          results.push({ ...t, alertType: "PUMP", progress });
+        }
       }
     }
-  }
+  } catch(e) {}
+
   results.sort((a,b) => (b.volume||0) - (a.volume||0));
   return results.slice(0, 10);
 }
 
-// ─── GET ULTRA EARLY ─────────────────────────────────────────────────────────
+// ─── GET ULTRA EARLY VIA DEXSCREENER ─────────────────────────────────────────
 async function getUltraEarlyLaunches() {
-  const urls = [
-    `https://gmgn.ai/defi/quotation/v1/rank/sol/pump?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
-    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/5m?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
-  ];
-  const responses = await Promise.allSettled(urls.map(u => fetchGMGN(u)));
-  const seen = new Set(); const results = [];
-  for (const r of responses) {
-    if (r.status !== "fulfilled" || !r.value) continue;
-    const tokens = r.value?.data?.rank || r.value?.data?.token_list || r.value?.data || [];
-    if (!Array.isArray(tokens)) continue;
+  const results = [];
+  try {
+    // DexScreener new pairs on Solana
+    const res = await axios.get(
+      `https://api.dexscreener.com/token-profiles/latest/v1`,
+      { timeout: 10000 }
+    );
+    const tokens = res.data || [];
+    const seen = new Set();
+
     for (const t of tokens) {
-      if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
-      seen.add(t.address);
+      if (t.chainId !== "solana") continue;
+      if (!t.tokenAddress || seen.has(t.tokenAddress)) continue;
+      seen.add(t.tokenAddress);
+
+      const detail = await getTokenDetail(t.tokenAddress);
+      if (!detail) continue;
+
+      const ageMs = detail.pairCreatedAt ? Date.now() - detail.pairCreatedAt : null;
+      if (!ageMs || ageMs > ULTRA_MAX_AGE_MS) continue;
+
+      const buyRatio = detail.sells > 0 ? detail.buys / detail.sells : detail.buys;
+      if (
+        detail.volume1h >= ULTRA_MIN_VOLUME &&
+        detail.txns >= ULTRA_MIN_HOLDERS &&
+        buyRatio >= ULTRA_MIN_BUY_RATIO &&
+        detail.liquidity >= 2000
+      ) {
+        results.push({
+          address: t.tokenAddress,
+          symbol: detail.symbol,
+          market_cap: detail.mc,
+          liquidity: detail.liquidity,
+          volume: detail.volume1h,
+          volume_5m: detail.volume1h,
+          price: detail.price,
+          open_timestamp: detail.pairCreatedAt ? detail.pairCreatedAt / 1000 : null,
+          holder_count: detail.txns,
+          rug_ratio: 0,
+          is_wash_trading: false,
+          creator_token_status: "unknown",
+          alertType: "ULTRA_EARLY",
+          ageMs,
+          progress: 0,
+          buys: detail.buys,
+          sells: detail.sells,
+          buyRatio,
+        });
+      }
+      if (results.length >= 5) break;
+    }
+  } catch(e) {
+    log(`Ultra early error: ${e.message}`);
+  }
+
+  // Also try GMGN
+  try {
+    const gmgnData = await fetchGMGN(`https://gmgn.ai/defi/quotation/v1/rank/sol/pump?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`);
+    const tokens = gmgnData?.data?.rank || [];
+    for (const t of tokens) {
+      if (!t.address) continue;
       const ageMs = t.open_timestamp ? Date.now() - t.open_timestamp * 1000 : null;
       if (!ageMs || ageMs > ULTRA_MAX_AGE_MS) continue;
-      const progress = t.launchpad_status?.bonding_curve_percentage || t.progress || 0;
-      const volume = t.volume || t.volume_5m || 0;
-      const holders = t.holder_count || t.holders || 0;
-      const buys = t.buy_5m || t.swaps_5m || t.txns_5m?.buys || 0;
-      const sells = t.sell_5m || t.txns_5m?.sells || 0;
+      const buys = t.buy_5m || t.swaps_5m || 0;
+      const sells = t.sell_5m || 0;
       const buyRatio = sells > 0 ? buys/sells : buys;
-      if (progress >= 3 && progress <= 60 && volume >= ULTRA_MIN_VOLUME && holders >= ULTRA_MIN_HOLDERS && buyRatio >= ULTRA_MIN_BUY_RATIO && (t.rug_ratio||0) < 0.2 && !t.is_wash_trading) {
-        results.push({ ...t, alertType: "ULTRA_EARLY", ageMs, progress, buys, sells, buyRatio });
+      if (buyRatio >= ULTRA_MIN_BUY_RATIO && (t.volume||0) >= ULTRA_MIN_VOLUME) {
+        results.push({ ...t, alertType: "ULTRA_EARLY", ageMs, progress: t.progress||0, buys, sells, buyRatio });
       }
     }
-  }
+  } catch(e) {}
+
   results.sort((a,b) => b.buyRatio - a.buyRatio);
   return results.slice(0, 5);
 }
