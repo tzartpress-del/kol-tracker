@@ -156,7 +156,7 @@ async function fetchGMGN(path) {
 
   try {
     const res = await axiosInstance.get(
-      `https://gmgn.ai${path}`,
+      `https://openapi.gmgn.ai${path}`,
       { headers: { "x-api-key": GMGN_API_KEY || "" } }
     );
 
