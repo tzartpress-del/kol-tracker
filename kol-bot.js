@@ -6,28 +6,27 @@ process.on("uncaughtException", console.error);
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const CHAT_ID = process.env.CHAT_ID;
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const CHAT_ID        = process.env.CHAT_ID;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
-const GMGN_API_KEY = process.env.GMGN_API_KEY;
+const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 
 // ─── FILTERS ─────────────────────────────────────────────────────────────────
-const MC_MIN = 15000;
-const MC_MAX = 150000;
-const POLL_INTERVAL_MS = 45000;
-const ALERT_COOLDOWN_MS = 3600000;
-const CLAUDE_DAILY_LIMIT = 50;
+const MC_MIN             = 15000;
+const MC_MAX             = 150000;
+const POLL_INTERVAL_MS   = 45000;
+const ALERT_COOLDOWN_MS  = 3600000;
+const MAX_AGE_MS         = 24 * 60 * 60 * 1000; // 24 hours
+const REENTRY_MIN_VEL    = 1.5;   // velocity threshold for old tokens
+const REENTRY_MIN_VOL    = 50000; // volume threshold for old tokens
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-const alerted = new Map();
-const claudeCache = new Map();
+const bot                = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+const alerted            = new Map();
 const performanceTracker = new Map();
-const insiderBuys = {};
-const lastSig = {};
-const blacklist = new Set();
-let claudeCallCount = 0;
-let lastGMGNCall = 0;
+const insiderBuys        = {};
+const lastSig            = {};
+const blacklist          = new Set();
+let lastGMGNCall         = 0;
 
 const botStats = {
   kol:   { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
@@ -47,7 +46,7 @@ bot.on("callback_query", async (query) => {
     }
     if (query.data === "stats") {
       await bot.answerCallbackQuery(query.id);
-      const s = botStats;
+      const s     = botStats;
       const kolWR  = s.kol.alerts  > 0 ? ((s.kol.hits2x  / s.kol.alerts)  * 100).toFixed(0) : 0;
       const pumpWR = s.pump.alerts > 0 ? ((s.pump.hits2x / s.pump.alerts) * 100).toFixed(0) : 0;
       const ultraWR= s.ultra.alerts> 0 ? ((s.ultra.hits2x/ s.ultra.alerts)* 100).toFixed(0) : 0;
@@ -62,7 +61,7 @@ bot.on("callback_query", async (query) => {
         `🚀 Ultra Early\n` +
         `Alerts: ${s.ultra.alerts} | 2x: ${s.ultra.hits2x} | 5x: ${s.ultra.hits5x} | 10x: ${s.ultra.hits10x}\n` +
         `Win Rate: ${ultraWR}%\n\n` +
-        `Blacklisted: ${blacklist.size} | Tracking: ${performanceTracker.size}`,
+        `Tracking: ${performanceTracker.size} tokens`,
         { parse_mode: "Markdown" }
       );
     }
@@ -74,8 +73,8 @@ function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
 
 function fmt(n) {
   if (!n && n !== 0) return "N/A";
-  if (n >= 1000000) return `$${(n / 1000000).toFixed(2)}M`;
-  if (n >= 1000)    return `$${(n / 1000).toFixed(1)}K`;
+  if (n >= 1000000)  return `$${(n / 1000000).toFixed(2)}M`;
+  if (n >= 1000)     return `$${(n / 1000).toFixed(1)}K`;
   return `$${n.toFixed(2)}`;
 }
 
@@ -109,9 +108,9 @@ function signalScore(token) {
   if (smart >= 3) s += 3; else if (smart >= 2) s += 2; else if (smart >= 1) s += 1;
   if (kol   >= 2) s += 2; else if (kol   >= 1) s += 1;
   if (rug < 0.1)  s += 2; else if (rug < 0.2)  s += 1;
-  if (token.renounced_mint             === 1) s += 1;
-  if (token.renounced_freeze_account   === 1) s += 1;
-  if (!token.is_wash_trading)                 s += 1;
+  if (token.renounced_mint           === 1) s += 1;
+  if (token.renounced_freeze_account === 1) s += 1;
+  if (!token.is_wash_trading)               s += 1;
   return s;
 }
 
@@ -123,105 +122,39 @@ function signalLabel(score) {
 }
 
 // ─── GMGN API FETCH (IPv4 forced, 1 req/sec) ─────────────────────────────────
-async function fetchGMGN(path, retries = 2) {
-  // Enforce 1 second gap between requests
-  const now = Date.now();
+async function fetchGMGN(path) {
+  const now  = Date.now();
   const wait = 1100 - (now - lastGMGNCall);
   if (wait > 0) await new Promise(r => setTimeout(r, wait));
   lastGMGNCall = Date.now();
 
-  const url = `https://gmgn.ai${path}`;
-
-  for (let i = 0; i < retries; i++) {
-    try {
-      const res = await axios.get(url, {
-        headers: {
-          "x-api-key": GMGN_API_KEY || "",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          "Accept": "application/json",
-          "Referer": "https://gmgn.ai/",
-        },
-        timeout: 12000,
-        // Force IPv4
-        family: 4,
-      });
-      return res.data;
-    } catch(e) {
-      const status = e.response?.status;
-      if (status === 429) {
-        log(`GMGN rate limit — waiting ${(i + 1) * 5}s`);
-        await new Promise(r => setTimeout(r, (i + 1) * 5000));
-      } else if (status === 403) {
-        log(`GMGN 403 — check API key or IPv6`);
-        return null;
-      } else {
-        log(`GMGN fetch error: ${e.message}`);
-        return null;
-      }
-    }
-  }
-  return null;
-}
-
-// ─── CLAUDE AI FILTER ─────────────────────────────────────────────────────────
-async function claudeFilter(token) {
-  const cached = claudeCache.get(token.address);
-  if (cached && Date.now() - cached.ts < 7200000) return cached.result;
-
-  const rug    = token.rug_ratio                  || 0;
-  const smart  = token.smart_degen_count          || 0;
-  const liq    = token.liquidity                  || 0;
-  const bundle = token.bundler_trader_amount_rate || 0;
-
-  // Hard reject without Claude
-  if (rug    > 0.5)              return { decision: "REJECT", reason: "Rug >50%",      risk: "VERY HIGH", confidence: 99 };
-  if (liq    < 3000)             return { decision: "REJECT", reason: "Liq too low",   risk: "VERY HIGH", confidence: 99 };
-  if (token.is_wash_trading)     return { decision: "REJECT", reason: "Wash trading",  risk: "VERY HIGH", confidence: 99 };
-  if (bundle > 0.5)              return { decision: "REJECT", reason: "Bundle >50%",   risk: "VERY HIGH", confidence: 99 };
-  if (blacklist.has(token.creator || "")) return { decision: "REJECT", reason: "Blacklisted deployer", risk: "VERY HIGH", confidence: 99 };
-
-  // Auto approve strong signals — saves credits
-  if (smart >= 3 && rug < 0.1 && liq > 10000) {
-    const result = { decision: "APPROVE", reason: "Strong smart money", risk: "LOW", confidence: 90 };
-    claudeCache.set(token.address, { result, ts: Date.now() });
-    return result;
-  }
-  if (smart >= 1 && rug < 0.15 && liq > 7000) {
-    const result = { decision: "APPROVE", reason: "Good signal", risk: "MEDIUM", confidence: 72 };
-    claudeCache.set(token.address, { result, ts: Date.now() });
-    return result;
-  }
-
-  // Skip Claude if no key or limit reached
-  if (!CLAUDE_API_KEY || claudeCallCount >= CLAUDE_DAILY_LIMIT) {
-    return { decision: "APPROVE", reason: "Auto approved", risk: "MEDIUM", confidence: 60 };
-  }
-
   try {
-    claudeCallCount++;
-    const prompt = `Solana memecoin. APPROVE unless clear scam.
-${token.symbol} Liq:$${liq} Rug:${(rug * 100).toFixed(0)}% Bundle:${(bundle * 100).toFixed(0)}%
-Smart:${smart} Holders:${token.holder_count || 0}
-REJECT only: rug>40% or bundle>50%. JSON: {"decision":"APPROVE","reason":"ok","risk":"MEDIUM","confidence":70}`;
-
-    const res = await axios.post(
-      "https://api.anthropic.com/v1/messages",
-      { model: "claude-haiku-4-5-20251001", max_tokens: 60, messages: [{ role: "user", content: prompt }] },
-      { headers: { "x-api-key": CLAUDE_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json" }, timeout: 8000 }
-    );
-    const text = res.data?.content?.[0]?.text || "";
-    const result = JSON.parse(text.replace(/```json|```/g, "").trim());
-    claudeCache.set(token.address, { result, ts: Date.now() });
-    log(`Claude [${claudeCallCount}/${CLAUDE_DAILY_LIMIT}]: ${token.symbol} -> ${result.decision}`);
-    return result;
+    const res = await axios.get(`https://gmgn.ai${path}`, {
+      headers: {
+        "x-api-key":  GMGN_API_KEY || "",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept":     "application/json",
+        "Referer":    "https://gmgn.ai/",
+      },
+      timeout: 12000,
+      family: 4, // force IPv4 — GMGN does not support IPv6
+    });
+    return res.data;
   } catch(e) {
-    return { decision: "APPROVE", reason: "AI unavailable", risk: "MEDIUM", confidence: 50 };
+    const status = e.response?.status;
+    if (status === 429) {
+      log(`GMGN rate limit — waiting 10s`);
+      await new Promise(r => setTimeout(r, 10000));
+    } else if (status === 403) {
+      log(`GMGN 403 — check API key`);
+    } else {
+      log(`GMGN error: ${e.message}`);
+    }
+    return null;
   }
 }
 
-setInterval(() => { claudeCallCount = 0; log("Claude counter reset"); }, 24 * 60 * 60 * 1000);
-
-// ─── INSIDER WALLETS ──────────────────────────────────────────────────────────
+// ─── INSIDER WALLETS (hardcoded) ─────────────────────────────────────────────
 const INSIDER_WALLETS = {
   "AVAZvHLR2PcWpDf8BXY4rVxNHYRBytycHkcB5z5QNXYm": "InsiderAlpha1",
   "4Be9CvxqHW6BYiRAxW9Q3xu1ycTMWaL5z8NX4HR3ha7t": "InsiderAlpha2",
@@ -255,7 +188,6 @@ async function pollInsiderWallets() {
     } catch(e) {}
     await new Promise(r => setTimeout(r, 500));
   }
-  // Cleanup entries older than 2 hours
   const cutoff = Date.now() - 7200000;
   for (const [mint, buyers] of Object.entries(insiderBuys)) {
     for (const [k, ts] of Object.entries(buyers)) {
@@ -265,10 +197,103 @@ async function pollInsiderWallets() {
   }
 }
 
+// ─── DYNAMIC SMART MONEY TRACKING ────────────────────────────────────────────
+// Fetches top active smart money wallets from GMGN every scan
+// Groups by token — finds cluster signals (3+ wallets buying same token)
+const smartMoneyBuys = {}; // mint -> { wallets: Set, lastSeen: timestamp }
+
+async function fetchSmartMoneyActivity() {
+  try {
+    const data = await fetchGMGN(`/api/v1/user/smartmoney?chain=sol&limit=100`);
+    const trades = data?.data?.list || data?.list || [];
+    if (!trades.length) {
+      log(`Smart money: no trades returned`);
+      return;
+    }
+
+    log(`Smart money: ${trades.length} trades fetched`);
+    const now = Date.now();
+
+    for (const trade of trades) {
+      if (trade.side !== "buy") continue;
+      const mint = trade.base_address;
+      if (!mint) continue;
+
+      if (!smartMoneyBuys[mint]) {
+        smartMoneyBuys[mint] = {
+          symbol:   trade.base_token?.symbol || "???",
+          wallets:  new Set(),
+          amounts:  [],
+          lastSeen: now,
+        };
+      }
+      smartMoneyBuys[mint].wallets.add(trade.maker);
+      smartMoneyBuys[mint].amounts.push(trade.amount_usd || 0);
+      smartMoneyBuys[mint].lastSeen = now;
+    }
+
+    // Cleanup entries older than 30 mins
+    const cutoff = now - 1800000;
+    for (const [mint, data] of Object.entries(smartMoneyBuys)) {
+      if (data.lastSeen < cutoff) delete smartMoneyBuys[mint];
+    }
+
+    // Check for cluster signals (3+ wallets buying same token)
+    for (const [mint, data] of Object.entries(smartMoneyBuys)) {
+      if (data.wallets.size >= 3 && !alerted.has(`cluster_${mint}`)) {
+        alerted.set(`cluster_${mint}`, Date.now());
+        const totalUsd = data.amounts.reduce((a, b) => a + b, 0);
+        log(`CLUSTER SIGNAL: $${data.symbol} — ${data.wallets.size} smart money wallets — $${totalUsd.toFixed(0)}`);
+        await sendClusterAlert(mint, data.symbol, data.wallets.size, totalUsd);
+      }
+    }
+  } catch(e) {
+    log(`Smart money activity error: ${e.message}`);
+  }
+}
+
+// ─── CLUSTER SIGNAL ALERT ────────────────────────────────────────────────────
+async function sendClusterAlert(mint, symbol, walletCount, totalUsd) {
+  const strength =
+    walletCount >= 5 ? "🔥🔥🔥 VERY STRONG" :
+    walletCount >= 4 ? "🔥🔥 STRONG"         :
+                       "🔥 MEDIUM";
+
+  const msg =
+    `⚡ *CLUSTER SIGNAL DETECTED* ⚡\n\n` +
+    `${strength}\n\n` +
+    `*$${symbol}*\n` +
+    `\`${mint}\`\n\n` +
+    `👥 *${walletCount} Smart Money wallets* buying same token!\n` +
+    `💵 Total volume: $${totalUsd.toFixed(0)}\n\n` +
+    `This is a strong convergence signal!\n` +
+    `Multiple whales entering simultaneously.\n\n` +
+    `💰 *Snipe 0.1 SOL?*`;
+
+  await bot.sendMessage(CHAT_ID, msg, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🚀 BUY via Trojan", url: `https://t.me/solana_trojanbot?start=ca_${mint}` }],
+        [
+          { text: "📊 DexScreener", url: `https://dexscreener.com/solana/${mint}` },
+          { text: "🔍 GMGN",        url: `https://gmgn.ai/sol/token/${mint}`      },
+        ],
+        [{ text: "⚡ Axiom", url: `https://axiom.trade/t/${mint}` }],
+      ],
+    },
+  });
+  log(`Cluster alert sent: $${symbol} — ${walletCount} wallets`);
+}
+
 // ─── PERFORMANCE TRACKER ─────────────────────────────────────────────────────
 async function getTokenPrice(mint) {
   try {
-    const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { timeout: 8000 });
+    const res = await axios.get(
+      `https://api.dexscreener.com/latest/dex/tokens/${mint}`,
+      { timeout: 8000 }
+    );
     const pairs = (res.data?.pairs || []).filter(p => p.chainId === "solana");
     if (!pairs.length) return null;
     pairs.sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
@@ -286,7 +311,8 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
   performanceTracker.set(mint, {
     alertPrice, alertMC, symbol,
     alertTime: Date.now(), alertMsgId, signalType,
-    peakX: 1, notified2x: false, notified5x: false, notified10x: false,
+    peakX: 1,
+    notified2x: false, notified5x: false, notified10x: false,
     notifiedDistribution: false,
   });
   const stats = botStats[signalType] || botStats.kol;
@@ -295,7 +321,6 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
     const tracker = performanceTracker.get(mint);
     if (!tracker) { clearInterval(interval); return; }
 
-    // 24hr final report
     if (Date.now() - tracker.alertTime > 86400000) {
       const verdict =
         tracker.peakX >= 10 ? "🌙 MOONSHOT" :
@@ -325,7 +350,6 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
       ).catch(() => {});
     }
 
-    // Milestones
     if (xGain >= 10 && !tracker.notified10x) {
       tracker.notified10x = true; stats.hits10x++;
       await bot.sendMessage(CHAT_ID,
@@ -346,7 +370,6 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
       ).catch(() => {});
     }
 
-    // Liquidity warning
     if (current.liquidity < 2000 && tracker.peakX > 1.5) {
       await bot.sendMessage(CHAT_ID,
         `⚠️ *LIQUIDITY WARNING!* ⚠️\n\n*$${symbol}* liq dropping!\n└ Liq: ${fmt(current.liquidity)}\n\n🚨 Exit now!`,
@@ -358,31 +381,7 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
   }, 3 * 60 * 1000);
 }
 
-// ─── SCANNER: GMGN TRENCHES (new token discovery) ────────────────────────────
-async function getTrenchesSignals() {
-  const results = [];
-  try {
-    // new_creation = brand new tokens, sorted by smart money count
-    const data = await fetchGMGN(
-      `/defi/quotation/v1/rank/sol/pump?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`
-    );
-    const tokens = data?.data?.rank || [];
-    for (const t of tokens) {
-      if (!t.address) continue;
-      const mc  = t.market_cap || 0;
-      const sm  = t.smart_degen_count || 0;
-      const kol = t.renowned_count    || 0;
-      if (mc < MC_MIN || mc > MC_MAX) continue;
-      if (sm < 1 && kol < 1)          continue;
-      if ((t.rug_ratio || 0) > 0.25)  continue;
-      if (t.is_wash_trading)           continue;
-      results.push({ ...t, alertType: "ULTRA_EARLY" });
-    }
-  } catch(e) { log(`Trenches error: ${e.message}`); }
-  return results.slice(0, 10);
-}
-
-// ─── SCANNER: GMGN KOL + SMART MONEY RANK ────────────────────────────────────
+// ─── SCANNER: KOL + SMART MONEY ──────────────────────────────────────────────
 async function getKOLSignals() {
   const results = [];
   try {
@@ -391,22 +390,33 @@ async function getKOLSignals() {
     );
     const tokens = data?.data?.rank || [];
     for (const t of tokens) {
-      if (!t.address) continue;
-      const mc  = t.market_cap          || 0;
-      const sm  = t.smart_degen_count   || 0;
-      const kol = t.renowned_count      || 0;
-      if (mc < MC_MIN || mc > MC_MAX)   continue;
-      if (sm < 1 || kol < 1)            continue;
-      if ((t.rug_ratio || 0) > 0.25)    continue;
-      if (t.is_wash_trading)             continue;
-      results.push({ ...t, alertType: "KOL" });
+      if (!t.address)                       continue;
+      const mc  = t.market_cap           || 0;
+      const sm  = t.smart_degen_count    || 0;
+      const kol = t.renowned_count       || 0;
+      if (mc < MC_MIN || mc > MC_MAX)      continue;
+      if (sm < 1 || kol < 1)              continue;
+      if ((t.rug_ratio || 0) > 0.25)      continue;
+      if (t.is_wash_trading)               continue;
+
+      const ageMs    = t.open_timestamp ? Date.now() - t.open_timestamp * 1000 : null;
+      const vol5m    = t.volume_5m || 0;
+      const vol1h    = t.volume    || 0;
+      const velocity = vol1h > 0 ? (vol5m * 12) / vol1h : 0;
+      const isNew    = ageMs !== null && ageMs <= MAX_AGE_MS;
+      const hasSpike = velocity >= REENTRY_MIN_VEL || vol1h >= REENTRY_MIN_VOL;
+
+      // Fresh tokens always pass — old tokens need a spike
+      if (!isNew && !hasSpike) continue;
+
+      results.push({ ...t, alertType: isNew ? "KOL" : "REENTRY" });
     }
-  } catch(e) { log(`KOL signals error: ${e.message}`); }
+  } catch(e) { log(`KOL error: ${e.message}`); }
   results.sort((a, b) => (b.smart_degen_count || 0) - (a.smart_degen_count || 0));
   return results.slice(0, 20);
 }
 
-// ─── SCANNER: GMGN PUMPFUN PRE-BOND ──────────────────────────────────────────
+// ─── SCANNER: PUMPFUN PRE-BOND ────────────────────────────────────────────────
 async function getPumpSignals() {
   const results = [];
   try {
@@ -417,7 +427,7 @@ async function getPumpSignals() {
     for (const t of tokens) {
       if (!t.address) continue;
       const progress = t.launchpad_status?.bonding_curve_percentage || t.progress || 0;
-      const volume   = t.volume || 0;
+      const volume   = t.volume       || 0;
       const holders  = t.holder_count || t.holders || 0;
       if (progress < 60 || progress > 98) continue;
       if (volume   < 20000)               continue;
@@ -426,9 +436,38 @@ async function getPumpSignals() {
       if (t.is_wash_trading)              continue;
       results.push({ ...t, alertType: "PUMP", progress });
     }
-  } catch(e) { log(`Pump signals error: ${e.message}`); }
+  } catch(e) { log(`Pump error: ${e.message}`); }
   results.sort((a, b) => (b.volume || 0) - (a.volume || 0));
   return results.slice(0, 10);
+}
+
+// ─── SCANNER: ULTRA EARLY ─────────────────────────────────────────────────────
+async function getUltraSignals() {
+  const results = [];
+  try {
+    const data = await fetchGMGN(
+      `/defi/quotation/v1/rank/sol/pump?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`
+    );
+    const tokens = data?.data?.rank || [];
+    for (const t of tokens) {
+      if (!t.address) continue;
+      const ageMs = t.open_timestamp ? Date.now() - t.open_timestamp * 1000 : null;
+      if (!ageMs || ageMs > 30 * 60 * 1000) continue; // under 30 mins only
+      const volume  = t.volume       || 0;
+      const holders = t.holder_count || t.holders || 0;
+      const buys    = t.buy_5m  || t.swaps_5m || 0;
+      const sells   = t.sell_5m || 0;
+      const ratio   = sells > 0 ? buys / sells : buys;
+      if (volume  < 3000)  continue;
+      if (holders < 30)    continue;
+      if (ratio   < 2)     continue;
+      if ((t.rug_ratio || 0) > 0.2) continue;
+      if (t.is_wash_trading)        continue;
+      results.push({ ...t, alertType: "ULTRA_EARLY", ageMs, buys, sells, buyRatio: ratio });
+    }
+  } catch(e) { log(`Ultra error: ${e.message}`); }
+  results.sort((a, b) => b.buyRatio - a.buyRatio);
+  return results.slice(0, 5);
 }
 
 // ─── BUILD KEYBOARD ───────────────────────────────────────────────────────────
@@ -442,7 +481,7 @@ function buildKeyboard(mint, isPump) {
       ],
       [
         { text: isPump ? "🎯 PumpFun" : "⚡ Axiom",
-          url: isPump ? `https://pump.fun/${mint}` : `https://axiom.trade/t/${mint}` },
+          url:  isPump ? `https://pump.fun/${mint}` : `https://axiom.trade/t/${mint}` },
         { text: "📈 Stats", callback_data: "stats" },
       ],
       [{ text: "❌ Skip", callback_data: `skip_${mint.slice(0, 20)}` }],
@@ -451,34 +490,33 @@ function buildKeyboard(mint, isPump) {
 }
 
 // ─── SEND KOL ALERT ───────────────────────────────────────────────────────────
-async function sendKOLAlert(token, aiResult) {
-  const mint      = token.address;
-  const symbol    = token.symbol || "???";
-  const mc        = token.market_cap || 0;
-  const age       = fmtAge(token.open_timestamp ? token.open_timestamp * 1000 : null);
-  const holders   = token.holder_count || "N/A";
-  const price     = token.price ? `$${parseFloat(token.price).toExponential(4)}` : "N/A";
-  const vol       = fmt(token.volume || 0);
-  const liq       = fmt(token.liquidity || 0);
-  const change1h  = token.price_change_percent1h || 0;
-  const vel       = getVelocity(token);
-  const velLabel  = velocityLabel(vel);
-  const score     = signalScore(token);
-  const label     = signalLabel(score);
-  const isReentry = token.alertType === "REENTRY";
-  const riskEmoji = aiResult.risk === "LOW" ? "🟢" : aiResult.risk === "MEDIUM" ? "🟡" : "🔴";
-  const devStatus = token.creator_token_status === "sell" ? "🔴 Sold" : token.creator_token_status === "hold" ? "🟢 Holding" : "🟡 N/A";
-  const mintR     = token.renounced_mint           === 1 ? "🟢 Yes" : "🔴 No";
-  const rugPct    = `${((token.rug_ratio || 0) * 100).toFixed(0)}%`;
-  const netflow   = (token.buy_5m || 0) > (token.sell_5m || 0) ? "🟢 Accumulating" : "🔴 Selling";
-  const insiders  = Object.keys(insiderBuys[mint] || {});
+async function sendKOLAlert(token) {
+  const mint       = token.address;
+  const symbol     = token.symbol || "???";
+  const mc         = token.market_cap || 0;
+  const age        = fmtAge(token.open_timestamp ? token.open_timestamp * 1000 : null);
+  const holders    = token.holder_count || "N/A";
+  const price      = token.price ? `$${parseFloat(token.price).toExponential(4)}` : "N/A";
+  const vol        = fmt(token.volume || 0);
+  const liq        = fmt(token.liquidity || 0);
+  const change1h   = token.price_change_percent1h || 0;
+  const vel        = getVelocity(token);
+  const velLabel   = velocityLabel(vel);
+  const score      = signalScore(token);
+  const label      = signalLabel(score);
+  const isReentry  = token.alertType === "REENTRY";
+  const devStatus  = token.creator_token_status === "sell" ? "🔴 Sold" : token.creator_token_status === "hold" ? "🟢 Holding" : "🟡 N/A";
+  const mintR      = token.renounced_mint           === 1 ? "🟢 Yes" : "🔴 No";
+  const rugPct     = `${((token.rug_ratio || 0) * 100).toFixed(0)}%`;
+  const netflow    = (token.buy_5m || 0) > (token.sell_5m || 0) ? "🟢 Accumulating" : "🔴 Selling";
+  const insiders   = Object.keys(insiderBuys[mint] || {});
   const insiderStr = insiders.length > 0
-    ? `\n└ 👛 ${insiders.join(", ")}${insiders.length >= 3 ? " 🔥 INSIDER CONVERGENCE" : ""}`
+    ? `\n└ 👛 ${insiders.join(", ")}${insiders.length >= 3 ? " 🔥 CONVERGENCE" : ""}`
     : "";
 
   const msg =
     `🚨 *${isReentry ? "REENTRY" : "KOL"} SIGNAL* — ${label}\n` +
-    `Score: ${score}/11 | AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
+    `Score: ${score}/11\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
     `└ ⏱ ${age} | 👁 ${holders} holders\n\n` +
@@ -511,7 +549,7 @@ async function sendKOLAlert(token, aiResult) {
 }
 
 // ─── SEND PUMP ALERT ──────────────────────────────────────────────────────────
-async function sendPumpAlert(token, aiResult) {
+async function sendPumpAlert(token) {
   const mint        = token.address;
   const symbol      = token.symbol || "???";
   const progress    = token.progress || 0;
@@ -522,11 +560,9 @@ async function sendPumpAlert(token, aiResult) {
   const price       = token.price ? `$${parseFloat(token.price).toExponential(4)}` : "N/A";
   const age         = fmtAge(token.open_timestamp ? token.open_timestamp * 1000 : null);
   const urgency     = progress >= 90 ? "🔴 MIGRATING SOON" : progress >= 75 ? "🟡 FILLING FAST" : "🟢 EARLY";
-  const riskEmoji   = aiResult.risk === "LOW" ? "🟢" : aiResult.risk === "MEDIUM" ? "🟡" : "🔴";
 
   const msg =
-    `🎯 *PUMPFUN PRE-BOND* — ${urgency}\n` +
-    `AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
+    `🎯 *PUMPFUN PRE-BOND* — ${urgency}\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
     `└ ⏱ ${age} | 👁 ${holders} holders\n\n` +
@@ -554,26 +590,23 @@ async function sendPumpAlert(token, aiResult) {
 }
 
 // ─── SEND ULTRA EARLY ALERT ───────────────────────────────────────────────────
-async function sendUltraAlert(token, aiResult) {
+async function sendUltraAlert(token) {
   const mint      = token.address;
   const symbol    = token.symbol || "???";
-  const ageMs     = token.open_timestamp ? Date.now() - token.open_timestamp * 1000 : 0;
-  const ageMin    = Math.floor(ageMs / 60000);
+  const ageMin    = Math.floor((token.ageMs || 0) / 60000);
   const holders   = token.holder_count || token.holders || "N/A";
   const vol       = fmt(token.volume || 0);
   const mc        = token.market_cap || token.usd_market_cap || 0;
   const price     = token.price ? `$${parseFloat(token.price).toExponential(4)}` : "N/A";
-  const buys      = token.buy_5m  || token.swaps_5m || 0;
-  const sells     = token.sell_5m || 0;
-  const buyRatio  = sells > 0 ? (buys / sells).toFixed(1) : buys > 0 ? "∞" : "0";
+  const buys      = token.buys  || 0;
+  const sells     = token.sells || 0;
+  const buyRatio  = token.buyRatio ? token.buyRatio.toFixed(1) : "N/A";
   const vel       = getVelocity(token);
   const momentum  = parseFloat(buyRatio) >= 10 ? "🔥🔥🔥 INSANE" : parseFloat(buyRatio) >= 5 ? "🔥🔥 VERY HIGH" : "🔥 HIGH";
-  const riskEmoji = aiResult.risk === "LOW" ? "🟢" : aiResult.risk === "MEDIUM" ? "🟡" : "🔴";
   const devStatus = token.creator_token_status === "sell" ? "🔴 Sold" : token.creator_token_status === "hold" ? "🟢 Holding" : "🟡 N/A";
 
   const msg =
-    `🚀 *ULTRA EARLY LAUNCH* — ${momentum}\n` +
-    `AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
+    `🚀 *ULTRA EARLY LAUNCH* — ${momentum}\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
     `└ ⏱ ${ageMin}m | 👁 ${holders} holders\n\n` +
@@ -604,34 +637,29 @@ async function sendUltraAlert(token, aiResult) {
 async function scan() {
   log("Scanning...");
   pollInsiderWallets().catch(() => {});
+  fetchSmartMoneyActivity().catch(() => {});
 
   const [kolTokens, pumpTokens, ultraTokens] = await Promise.all([
     getKOLSignals(),
     getPumpSignals(),
-    getTrenchesSignals(),
+    getUltraSignals(),
   ]);
 
   log(`KOL: ${kolTokens.length} | Pump: ${pumpTokens.length} | Ultra: ${ultraTokens.length}`);
 
-  // Merge all — ultra first (most time sensitive)
+  // Merge — ultra first (most time sensitive)
   const allTokens = [
     ...ultraTokens.map(t => ({ ...t, _type: "ultra" })),
     ...kolTokens.map(t =>   ({ ...t, _type: "kol"   })),
     ...pumpTokens.map(t =>  ({ ...t, _type: "pump"  })),
   ];
 
-  // Run Claude in parallel
-  const aiResults = await Promise.all(allTokens.map(t => claudeFilter(t)));
+  // Sort by score
+  allTokens.sort((a, b) => signalScore(b) - signalScore(a));
 
-  // Filter rejected + sort by score
-  const scored = allTokens
-    .map((t, i) => ({ ...t, _ai: aiResults[i], _score: signalScore(t) }))
-    .filter((t, i) => aiResults[i]?.decision !== "REJECT")
-    .sort((a, b) => b._score - a._score);
-
-  // Send top 5 per scan
+  // Send top 5
   let sent = 0;
-  for (const token of scored) {
+  for (const token of allTokens) {
     if (sent >= 5) break;
     const mint      = token.address;
     const lastAlert = alerted.get(mint);
@@ -639,39 +667,35 @@ async function scan() {
     alerted.set(mint, Date.now());
 
     try {
-      if (token._type === "ultra") await sendUltraAlert(token, token._ai);
-      else if (token._type === "pump") await sendPumpAlert(token, token._ai);
-      else await sendKOLAlert(token, token._ai);
+      if (token._type === "ultra") await sendUltraAlert(token);
+      else if (token._type === "pump") await sendPumpAlert(token);
+      else await sendKOLAlert(token);
       sent++;
     } catch(e) { log(`Alert error: ${e.message}`); }
     await new Promise(r => setTimeout(r, 1500));
   }
 
-  // Cleanup
+  // Cleanup old cooldowns
   const now = Date.now();
   for (const [mint, ts] of alerted.entries()) {
     if (now - ts > ALERT_COOLDOWN_MS) alerted.delete(mint);
-  }
-  for (const [k, v] of claudeCache.entries()) {
-    if (now - v.ts > 7200000) claudeCache.delete(k);
   }
 }
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker v15 - GMGN Official API");
+  log("KOL Tracker v15 - Clean");
 
   await bot.sendMessage(CHAT_ID,
     `🟢 *KOL Tracker v15 Online*\n\n` +
-    `✅ GMGN Official API\n` +
-    `✅ IPv4 forced (fixes 403)\n` +
-    `✅ 1 req/sec rate limiting\n` +
-    `✅ KOL + Smart Money signals\n` +
-    `✅ PumpFun Pre-Bond alerts\n` +
-    `✅ Ultra Early Launch alerts\n` +
-    `✅ Milestone tracking 2x 5x 10x\n` +
-    `✅ Claude AI 50 calls/day\n` +
-    `✅ 6 insider wallets tracked\n\n` +
+    `No Claude — clean signals only\n\n` +
+    `✅ KOL + Smart Money (24hr fresh)\n` +
+    `✅ Old tokens only on volume spike\n` +
+    `✅ PumpFun Pre-Bond\n` +
+    `✅ Ultra Early (under 30 mins)\n` +
+    `✅ Milestone alerts 2x 5x 10x\n` +
+    `✅ 6 insider wallets tracked\n` +
+    `✅ IPv4 forced\n\n` +
     `Scan every 45s`,
     { parse_mode: "Markdown" }
   );
