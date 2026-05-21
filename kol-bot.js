@@ -373,6 +373,7 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
 }
 
 // ─── GMGN FETCH ──────────────────────────────────────────────────────────────
+const GMGN_API_KEY = process.env.GMGN_API_KEY;
 const USER_AGENTS = [
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
   "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
@@ -385,28 +386,32 @@ let uaIndex = 0;
 async function fetchGMGN(url, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
-      // Rotate user agent each request
       const ua = USER_AGENTS[uaIndex % USER_AGENTS.length];
       uaIndex++;
-      const res = await axios.get(url, {
+
+      // Add API key if available — bypasses Cloudflare
+      const authUrl = GMGN_API_KEY
+        ? url + (url.includes("?") ? "&" : "?") + `api_key=${GMGN_API_KEY}`
+        : url;
+
+      const res = await axios.get(authUrl, {
         headers: {
           "User-Agent": ua,
           "Accept": "application/json, text/plain, */*",
           "Accept-Language": "en-US,en;q=0.9",
           "Referer": "https://gmgn.ai/",
           "Origin": "https://gmgn.ai",
-          "Cache-Control": "no-cache",
         },
         timeout: 12000,
       });
       return res.data;
     } catch(e) {
       const status = e.response?.status;
-      if (status === 429 || status === 403) {
+      if (status === 403 || status === 429) {
         log(`Rate limited (${status}), waiting ${(i+1)*8}s...`);
         await new Promise(r => setTimeout(r, (i+1) * 8000));
       } else if (status === 404) {
-        log(`GMGN 404 for URL — skipping`);
+        log(`GMGN 404 — skipping`);
         return null;
       } else {
         log(`Fetch error: ${e.message}`);
