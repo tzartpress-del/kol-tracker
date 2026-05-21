@@ -243,8 +243,14 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
     const tracker = performanceTracker.get(mint);
     if (!tracker) { clearInterval(interval); return; }
     if (Date.now() - tracker.alertTime > 86400000) {
+      const verdict = tracker.peakX >= 10 ? "🌙 MOONSHOT" : tracker.peakX >= 5 ? "🔥 BANGER" : tracker.peakX >= 2 ? "✅ WIN" : tracker.peakX >= 1 ? "🟡 BREAKEVEN" : "🔴 RUG";
       await bot.sendMessage(CHAT_ID,
-        `Final: $${symbol}\nPeak: ${tracker.peakX.toFixed(2)}x\nVerdict: ${tracker.peakX >= 10 ? "MOONSHOT" : tracker.peakX >= 5 ? "BANGER" : tracker.peakX >= 2 ? "WIN" : tracker.peakX >= 1 ? "BREAKEVEN" : "RUG"}`
+        `📋 *24hr Final Report*\n\n` +
+        `*$${symbol}*\n` +
+        `├ Peak gain: *${tracker.peakX.toFixed(2)}x*\n` +
+        `└ Verdict: ${verdict}\n\n` +
+        `Signal type: ${signalType.toUpperCase()}`,
+        { parse_mode: "Markdown" }
       ).catch(()=>{});
       performanceTracker.delete(mint);
       clearInterval(interval);
@@ -257,16 +263,49 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
 
     if (xGain >= 10 && !tracker.notified10x) {
       tracker.notified10x = true; stats.hits10x++;
-      await bot.sendMessage(CHAT_ID, `🌙 10x! $${symbol}\nMC: ${fmt(current.mc)}\nTake profit!`, { reply_to_message_id: alertMsgId }).catch(()=>{});
+      await bot.sendMessage(CHAT_ID,
+        `🌙🌙🌙 *10x MILESTONE!* 🌙🌙🌙\n\n` +
+        `*$${symbol}* is up *${xGain.toFixed(2)}x* from alert!\n\n` +
+        `├ Alert MC: ${fmt(alertMC)}\n` +
+        `├ Current MC: ${fmt(current.mc)}\n` +
+        `└ Liquidity: ${fmt(current.liquidity)}\n\n` +
+        `🏆 MOONSHOT CONFIRMED!\n` +
+        `Consider taking significant profit!`,
+        { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
+      ).catch(()=>{});
     } else if (xGain >= 5 && !tracker.notified5x) {
       tracker.notified5x = true; stats.hits5x++;
-      await bot.sendMessage(CHAT_ID, `🚀 5x! $${symbol}\nMC: ${fmt(current.mc)}\nConsider taking profit!`, { reply_to_message_id: alertMsgId }).catch(()=>{});
+      await bot.sendMessage(CHAT_ID,
+        `🚀🚀 *5x MILESTONE!* 🚀🚀\n\n` +
+        `*$${symbol}* is up *${xGain.toFixed(2)}x* from alert!\n\n` +
+        `├ Alert MC: ${fmt(alertMC)}\n` +
+        `├ Current MC: ${fmt(current.mc)}\n` +
+        `└ Liquidity: ${fmt(current.liquidity)}\n\n` +
+        `🔥 BANGER ALERT!\n` +
+        `Consider taking 25-50% profit!`,
+        { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
+      ).catch(()=>{});
     } else if (xGain >= 2 && !tracker.notified2x) {
       tracker.notified2x = true; stats.hits2x++;
-      await bot.sendMessage(CHAT_ID, `✅ 2x! $${symbol}\nMC: ${fmt(current.mc)}\nConsider 25% profit!`, { reply_to_message_id: alertMsgId }).catch(()=>{});
+      await bot.sendMessage(CHAT_ID,
+        `✅ *2x MILESTONE!* ✅\n\n` +
+        `*$${symbol}* is up *${xGain.toFixed(2)}x* from alert!\n\n` +
+        `├ Alert MC: ${fmt(alertMC)}\n` +
+        `├ Current MC: ${fmt(current.mc)}\n` +
+        `└ Liquidity: ${fmt(current.liquidity)}\n\n` +
+        `💰 Consider taking 25% profit!\n` +
+        `Let the rest ride 🎯`,
+        { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
+      ).catch(()=>{});
     }
     if (current.liquidity < 2000 && tracker.peakX > 1.5) {
-      await bot.sendMessage(CHAT_ID, `⚠️ LIQ WARNING! $${symbol} - Exit now!`, { reply_to_message_id: alertMsgId }).catch(()=>{});
+      await bot.sendMessage(CHAT_ID,
+        `⚠️ *LIQUIDITY WARNING!* ⚠️\n\n` +
+        `*$${symbol}* liquidity dropping fast!\n` +
+        `└ Liq: ${fmt(current.liquidity)}\n\n` +
+        `🚨 Consider exiting now!`,
+        { parse_mode: "Markdown", reply_to_message_id: alertMsgId }
+      ).catch(()=>{});
       performanceTracker.delete(mint); clearInterval(interval);
     }
   }, 3 * 60 * 1000);
@@ -419,18 +458,27 @@ async function sendKOLAlert(token, aiResult) {
   const netflow = (token.buy_5m||0) > (token.sell_5m||0) ? "Accumulating" : "Selling";
 
   const msg =
-    `🚨 ${isReentry ? "REENTRY" : "KOL"} SIGNAL - ${label}\n` +
+    `🚨 *${isReentry ? "REENTRY" : "KOL"} SIGNAL* - ${label}\n` +
     `Score: ${score}/11 | AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
-    `Age: ${age} | Holders: ${holders}\n\n` +
-    `Price: ${price} | MC: ${fmt(mc)}\n` +
-    `Vol: ${vol} | Liq: ${liq}\n` +
-    `1h: ${change1h > 0 ? "+" : ""}${change1h.toFixed(1)}%\n` +
-    `Velocity: ${vel}x | Netflow: ${netflow}\n\n` +
-    `Smart Money: ${smartCount} | KOL: ${kolCount}${insiderStr}\n\n` +
-    `Dev: ${devStatus} | Mint: ${mintR} | Rug: ${rugPct}\n\n` +
-    `💰 Snipe 0.1 SOL?`;
+    `└ ⏱ ${age} | 👁 ${holders} holders\n\n` +
+    `📊 *Token Details*\n` +
+    `├ PRICE:   ${price}\n` +
+    `├ MC:      ${fmt(mc)}\n` +
+    `├ Vol 1h:  ${vol}\n` +
+    `├ Liq:     ${liq}\n` +
+    `├ 1h Chg:  ${change1h > 0 ? "+" : ""}${change1h.toFixed(1)}%\n` +
+    `└ Velocity: ${vel}x\n\n` +
+    `🧠 *Smart Signals*\n` +
+    `├ Smart Money: ${smartCount} 🤖\n` +
+    `├ KOL Holders: ${kolCount} 👑\n` +
+    `└ Netflow: ${netflow}${insiderStr}\n\n` +
+    `🔒 *Security*\n` +
+    `├ Dev: ${devStatus}\n` +
+    `├ Mint Rncd: ${mintR}\n` +
+    `└ Rug: ${rugPct}\n\n` +
+    `💰 *Snipe 0.1 SOL?*`;
 
   const sent = await bot.sendMessage(CHAT_ID, msg, { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: buildKeyboard(mint, false) });
   const alertPrice = token.price ? parseFloat(token.price) : null;
@@ -454,17 +502,22 @@ async function sendPumpAlert(token, aiResult) {
   const riskEmoji = aiResult.risk === "LOW" ? "🟢" : aiResult.risk === "MEDIUM" ? "🟡" : "🔴";
 
   const msg =
-    `🎯 PUMPFUN PRE-BOND - ${urgency}\n` +
+    `🎯 *PUMPFUN PRE-BOND* - ${urgency}\n` +
     `AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
-    `Age: ${age} | Holders: ${holders}\n\n` +
+    `└ ⏱ ${age} | 👁 ${holders} holders\n\n` +
+    `🏦 *Bonding Curve*\n` +
     `[${progressBar}] ${progress.toFixed(1)}%\n\n` +
-    `Price: ${price} | MC: ${mc}\n` +
-    `Vol: ${vol}\n` +
-    `Smart: ${token.smart_degen_count||0} | KOL: ${token.renowned_count||0}\n\n` +
-    `Buy before Raydium migration!\n` +
-    `💰 Snipe 0.1 SOL?`;
+    `📊 *Token Details*\n` +
+    `├ PRICE: ${price}\n` +
+    `├ MC:    ${mc}\n` +
+    `└ Vol:   ${vol}\n\n` +
+    `🧠 *Smart Signals*\n` +
+    `├ Smart Money: ${token.smart_degen_count||0} 🤖\n` +
+    `└ KOL Holders: ${token.renowned_count||0} 👑\n\n` +
+    `⚡ Buy before Raydium migration!\n` +
+    `💰 *Snipe 0.1 SOL?*`;
 
   const sent = await bot.sendMessage(CHAT_ID, msg, { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: buildKeyboard(mint, true) });
   const alertPrice = token.price ? parseFloat(token.price) : null;
@@ -493,18 +546,25 @@ async function sendUltraEarlyAlert(token, aiResult) {
   const devStatus = token.creator_token_status === "sell" ? "Sold" : token.creator_token_status === "hold" ? "Holding" : "N/A";
 
   const msg =
-    `🚀 ULTRA EARLY - ${momentum} MOMENTUM\n` +
+    `🚀 *ULTRA EARLY* - ${momentum} MOMENTUM\n` +
     `AI: ${riskEmoji} ${aiResult.risk} ${aiResult.confidence}%\n\n` +
     `*$${symbol}*\n` +
     `\`${mint}\`\n` +
-    `Age: ${ageMin}m | Holders: ${holders}\n\n` +
+    `└ ⏱ ${ageMin}m | 👁 ${holders} holders\n\n` +
+    `🏦 *Bonding Curve*\n` +
     `[${progressBar}] ${progress.toFixed(1)}%\n\n` +
-    `Price: ${price} | MC: ${fmt(mc)}\n` +
-    `Vol 5m: ${vol5m}\n` +
-    `Buys: ${buys} | Sells: ${sells}\n` +
-    `B/S Ratio: ${buyRatio}:1 | Velocity: ${vel}x\n\n` +
-    `Dev: ${devStatus}\n\n` +
-    `💰 Snipe 0.1 SOL?\nAlways DYOR`;
+    `📊 *Token Details*\n` +
+    `├ PRICE: ${price}\n` +
+    `└ MC:    ${fmt(mc)}\n\n` +
+    `⚡ *Momentum (5min)*\n` +
+    `├ Vol:      ${vol5m}\n` +
+    `├ Buys:     ${buys}\n` +
+    `├ Sells:    ${sells}\n` +
+    `├ B/S:      ${buyRatio}:1\n` +
+    `└ Velocity: ${vel}x\n\n` +
+    `🔒 Dev: ${devStatus}\n\n` +
+    `💰 *Snipe 0.1 SOL?*\n` +
+    `Always DYOR`;
 
   const sent = await bot.sendMessage(CHAT_ID, msg, { parse_mode: "Markdown", disable_web_page_preview: true, reply_markup: buildKeyboard(mint, true) });
   const alertPrice = token.price ? parseFloat(token.price) : null;
