@@ -14,7 +14,7 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 // ─── FILTERS ─────────────────────────────────────────────────────────────────
 const MC_MIN = 15000;
 const MC_MAX = 150000;
-const POLL_INTERVAL_MS = 45000; // 45s — reduces GMGN rate limiting
+const POLL_INTERVAL_MS = 60000; // 60s — respects GMGN 1 req/sec limit
 const ALERT_COOLDOWN_MS = 3600000;
 const MAX_TOKEN_AGE_MS = 24 * 60 * 60 * 1000;
 const REENTRY_MIN_VOLUME = 50000;
@@ -372,54 +372,50 @@ async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, s
   }, 3 * 60 * 1000);
 }
 
-// ─── GMGN FETCH ──────────────────────────────────────────────────────────────
+// ─── GMGN FETCH (1 req/sec limit) ────────────────────────────────────────────
 const GMGN_API_KEY = process.env.GMGN_API_KEY;
-const USER_AGENTS = [
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/118.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
-];
-let uaIndex = 0;
+const GMGN_CF_COOKIE = process.env.GMGN_CF_COOKIE;
+let lastGMGNCall = 0;
 
-async function fetchGMGN(url, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const ua = USER_AGENTS[uaIndex % USER_AGENTS.length];
-      uaIndex++;
+async function fetchGMGN(url) {
+  // Enforce 1 request per second
+  const now = Date.now();
+  const wait = 1100 - (now - lastGMGNCall);
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  lastGMGNCall = Date.now();
 
-      // Add API key if available — bypasses Cloudflare
-      const authUrl = GMGN_API_KEY
-        ? url + (url.includes("?") ? "&" : "?") + `api_key=${GMGN_API_KEY}`
-        : url;
+  try {
+    const headers = {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Accept": "application/json",
+      "Referer": "https://gmgn.ai/",
+      "Origin": "https://gmgn.ai",
+    };
 
-      const res = await axios.get(authUrl, {
-        headers: {
-          "User-Agent": ua,
-          "Accept": "application/json, text/plain, */*",
-          "Accept-Language": "en-US,en;q=0.9",
-          "Referer": "https://gmgn.ai/",
-          "Origin": "https://gmgn.ai",
-        },
-        timeout: 12000,
-      });
-      return res.data;
-    } catch(e) {
-      const status = e.response?.status;
-      if (status === 403 || status === 429) {
-        log(`Rate limited (${status}), waiting ${(i+1)*8}s...`);
-        await new Promise(r => setTimeout(r, (i+1) * 8000));
-      } else if (status === 404) {
-        log(`GMGN 404 — skipping`);
-        return null;
-      } else {
-        log(`Fetch error: ${e.message}`);
-        return null;
-      }
+    // Add API key
+    if (GMGN_API_KEY) {
+      headers["x-api-key"] = GMGN_API_KEY;
     }
+
+    // Add cf_clearance cookie if available
+    if (GMGN_CF_COOKIE) {
+      headers["Cookie"] = `cf_clearance=${GMGN_CF_COOKIE}`;
+    }
+
+    const res = await axios.get(url, { headers, timeout: 12000 });
+    return res.data;
+  } catch(e) {
+    const status = e.response?.status;
+    if (status === 403) {
+      log(`GMGN 403 — rate limited or blocked`);
+    } else if (status === 429) {
+      log(`GMGN 429 — too many requests, waiting 10s`);
+      await new Promise(r => setTimeout(r, 10000));
+    } else {
+      log(`GMGN fetch error: ${e.message}`);
+    }
+    return null;
   }
-  return null;
 }
 
 // ─── GET KOL SIGNALS VIA DEXSCREENER ────────────────────────────────────────
