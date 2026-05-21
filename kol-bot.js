@@ -1,12 +1,6 @@
 const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
-
-// ─── MODULE IMPORTS (safe — bot runs even if modules fail) ────────────────────
-let brain, security, commands, weeklyReport;
-try { brain = require("./brain"); } catch(e) { console.log("brain.js not loaded:", e.message); }
-try { security = require("./security"); } catch(e) { console.log("security.js not loaded:", e.message); }
-try { commands = require("./commands"); } catch(e) { console.log("commands.js not loaded:", e.message); }
-try { weeklyReport = require("./weekly-report"); } catch(e) { console.log("weekly-report.js not loaded:", e.message); }
+const fs = require("fs");
 
 // ─── PRODUCTION STABILITY ────────────────────────────────────────────────────
 process.on("unhandledRejection", console.error);
@@ -87,11 +81,13 @@ function paperBuy(mint, price, symbol, signalType, score) {
     symbol, signalType, openTime: Date.now(),
     tp1Hit: false, tp2Hit: false,
   });
-  // Log to brain
+  // Log to brain if available
   try {
-    const db = brain.loadDB();
-    brain.logTrade(db, { mint, symbol, signalType, entryPrice: price, entryTime: Date.now(), score: score||0, sizeSol: PAPER_TRADE_SIZE_SOL });
-  } catch(e) { log(`Brain log error: ${e.message}`); }
+    if (typeof brain !== "undefined" && brain) {
+      const db = brain.loadDB();
+      brain.logTrade(db, { mint, symbol, signalType, entryPrice: price, entryTime: Date.now(), score: score||0, sizeSol: PAPER_TRADE_SIZE_SOL });
+    }
+  } catch(e) {}
   log(`Paper BUY: $${symbol} @ $${price} | Capital: ${paperPortfolio.capital.toFixed(3)} SOL`);
 }
 
@@ -121,11 +117,13 @@ function paperSell(mint, price, reason) {
     else paperPortfolio.losses++;
     paperPortfolio.trades.push({ symbol: pos.symbol, entryPrice: pos.entryPrice, exitPrice: price, xGain, pnlSol, signalType: pos.signalType, duration: Date.now() - pos.openTime });
     paperPortfolio.openPositions.delete(mint);
-    // Close in brain
+    // Close in brain if available
     try {
-      const db = brain.loadDB();
-      brain.closeTrade(db, mint, price, reason);
-    } catch(e) { log(`Brain close error: ${e.message}`); }
+      if (typeof brain !== "undefined" && brain) {
+        const db = brain.loadDB();
+        brain.closeTrade(db, mint, price, reason);
+      }
+    } catch(e) {}
     log(`Paper SELL: $${pos.symbol} @ ${xGain.toFixed(2)}x | PnL: ${pnlSol > 0 ? "+" : ""}${pnlSol.toFixed(4)} SOL`);
   }
   return { xGain, pnlSol };
@@ -770,10 +768,10 @@ async function scan() {
 async function main() {
   log("KOL Tracker v14 - Full System");
 
-  // Initialize all modules safely
-  try { if (brain) { const db = brain.loadDB(); log(`Brain: ${db.stats.totalTrades} trades loaded`); } } catch(e) { log(`Brain init error: ${e.message}`); }
-  try { if (commands) commands.init(bot, CHAT_ID); log("Commands: active"); } catch(e) { log(`Commands init error: ${e.message}`); }
-  try { if (weeklyReport) weeklyReport.init(bot); log("Weekly report: scheduled"); } catch(e) { log(`Weekly report init error: ${e.message}`); }
+  // Initialize modules safely
+  try { if (typeof brain !== "undefined" && brain) { const db = brain.loadDB(); log(`Brain: ${db.stats.totalTrades} trades`); } } catch(e) {}
+  try { if (typeof commands !== "undefined" && commands) commands.init(bot, CHAT_ID); } catch(e) {}
+  try { if (typeof weeklyReport !== "undefined" && weeklyReport) weeklyReport.init(bot); } catch(e) {}
 
   await bot.sendMessage(CHAT_ID,
     `KOL Tracker Bot v14 Online\n\n` +
