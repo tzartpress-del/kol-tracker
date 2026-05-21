@@ -192,20 +192,21 @@ function fmtAge(ts) {
 
 // ─── HARD FILTER (before Claude) ─────────────────────────────────────────────
 function hardFilter(token) {
+function hardFilter(token) {
   const holders = token.holder_count || 0;
   const liq = token.liquidity || 0;
-  const rug = token.rug_ratio || 1;
-  const bundle = token.bundler_trader_amount_rate || 1;
+  const rug = token.rug_ratio || 0;  // default 0 not 1
+  const bundle = token.bundler_trader_amount_rate || 0; // default 0 not 1
   const smart = token.smart_degen_count || 0;
   const top10 = token.top_10_holder_rate || 0;
-  const holders500 = holders > 500 && (token.volume || 0) < 10000; // anti-farm
+  const holders500 = holders > 500 && (token.volume || 0) < 10000;
 
-  if (holders < 40) return false;
-  if (liq < 7000) return false;
-  if (rug > 0.18) return false;
-  if (bundle > 0.25) return false;
+  if (holders < 30) return false;       // loosened from 40
+  if (liq < 5000) return false;         // loosened from 7000
+  if (rug > 0.25) return false;         // loosened from 0.18
+  if (bundle > 0.40) return false;      // loosened from 0.25
   if (smart === 0) return false;
-  if (top10 > 0.35) return false;
+  if (top10 > 0.40) return false;       // loosened from 0.35
   if (holders500) return false;
   if (blacklist.has(token.creator || "")) return false;
   return true;
@@ -731,12 +732,11 @@ async function scan() {
   }).filter(t => aiResults[filtered.indexOf(t)]?.decision !== "REJECT")
     .sort((a,b) => b._finalScore - a._finalScore);
 
-  // Send TOP 3 only per scan
+  // Send TOP 5 per scan (was 3 — too restrictive)
   let sent = 0;
   for (const token of scored) {
-    if (sent >= 3) break;
+    if (sent >= 5) break;
     const mint = token.address;
-    if (globalAlerted.has(mint)) continue;
     const lastAlert = alerted.get(mint);
     if (lastAlert && Date.now() - lastAlert < ALERT_COOLDOWN_MS) continue;
 
@@ -752,15 +752,17 @@ async function scan() {
     await new Promise(r => setTimeout(r, 1500));
   }
 
-  // Memory cleanup
-  if (globalAlerted.size > 500) {
-    const arr = [...globalAlerted];
-    arr.slice(0, 100).forEach(m => globalAlerted.delete(m));
+  // Memory cleanup — reset globalAlerted after cooldown expires
+  const now = Date.now();
+  for (const mint of globalAlerted) {
+    const lastAlert = alerted.get(mint);
+    if (!lastAlert || now - lastAlert > ALERT_COOLDOWN_MS) {
+      globalAlerted.delete(mint);
+    }
   }
   // Clean claude cache
-  const now = Date.now();
   for (const [k, v] of claudeCache.entries()) {
-    if (now - v.ts > 1800000) claudeCache.delete(k);
+    if (now - v.ts > 7200000) claudeCache.delete(k);
   }
 }
 
