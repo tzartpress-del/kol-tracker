@@ -621,15 +621,16 @@ async function scanInsiderWallets() {
   }
 }
 
-// ─── SCANNER: KOL SIGNALS (GMGN) ─────────────────────────────────────────────
+// ─── SCANNER: KOL SIGNALS ────────────────────────────────────────────────────
 async function getKOLSignals() {
   const results = [];
   try {
     const data = await fetchGMGN(
-      `/defi/quotation/v1/rank/sol/swaps/1h?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`
+      `/v1/token/sol/trending?interval=1h&orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`
     );
-    const tokens = data?.data?.rank || [];
-    for (const t of tokens) {
+    const tokens = data?.data?.rank || data?.data?.tokens || data?.data || [];
+    const list = Array.isArray(tokens) ? tokens : [];
+    for (const t of list) {
       if (!t.address) continue;
       const mc  = t.market_cap        || 0;
       const sm  = t.smart_degen_count || 0;
@@ -659,10 +660,11 @@ async function getPumpSignals() {
   const results = [];
   try {
     const data = await fetchGMGN(
-      `/defi/quotation/v1/rank/sol/pump?orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`
+      `/v1/token/sol/pump?orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`
     );
-    const tokens = data?.data?.rank || [];
-    for (const t of tokens) {
+    const tokens = data?.data?.rank || data?.data?.tokens || data?.data || [];
+    const list = Array.isArray(tokens) ? tokens : [];
+    for (const t of list) {
       if (!t.address) continue;
       const progress = t.launchpad_status?.bonding_curve_percentage || t.progress || 0;
       if (progress < 60 || progress > 98) continue;
@@ -682,10 +684,11 @@ async function getUltraSignals() {
   const results = [];
   try {
     const data = await fetchGMGN(
-      `/defi/quotation/v1/rank/sol/pump?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`
+      `/v1/token/sol/pump?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`
     );
-    const tokens = data?.data?.rank || [];
-    for (const t of tokens) {
+    const tokens = data?.data?.rank || data?.data?.tokens || data?.data || [];
+    const list = Array.isArray(tokens) ? tokens : [];
+    for (const t of list) {
       if (!t.address) continue;
       const ageMs = t.open_timestamp ? Date.now() - t.open_timestamp * 1000 : null;
       if (!ageMs || ageMs > 30 * 60 * 1000) continue;
@@ -705,16 +708,16 @@ async function getUltraSignals() {
 // ─── SMART MONEY CLUSTER ─────────────────────────────────────────────────────
 async function fetchSmartMoneyActivity() {
   try {
-    const data = await fetchGMGN(`/defi/quotation/v1/smartmoney/sol?limit=100`);
+    const data = await fetchGMGN(`/v1/smartmoney/sol/walletNew?limit=100`);
     if (!data || typeof data !== "object") return;
-    const trades = data?.data?.list || [];
+    const trades = data?.data?.list || data?.data || [];
     if (!Array.isArray(trades) || !trades.length) return;
 
     log(`Smart money: ${trades.length} trades`);
     const now = Date.now();
 
     for (const trade of trades) {
-      const mint = trade.address || trade.base_address;
+      const mint = trade.address || trade.base_address || trade.token_address;
       if (!mint) continue;
       if (!smartMoneyBuys[mint]) {
         smartMoneyBuys[mint] = { symbol: trade.symbol || trade.base_token?.symbol || "???", wallets: new Set(), amounts: [], lastSeen: now };
@@ -815,4 +818,3 @@ async function main() {
 }
 
 main().catch(e => { log(`Fatal: ${e.message}`); process.exit(1); });
-
