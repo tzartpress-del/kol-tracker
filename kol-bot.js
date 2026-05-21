@@ -121,7 +121,17 @@ function signalLabel(score) {
   return "🟡 LOW";
 }
 
-// ─── GMGN API FETCH (IPv4 forced, 1 req/sec) ─────────────────────────────────
+// ─── GMGN API FETCH (IPv4 forced via DNS, 1 req/sec) ─────────────────────────
+const http  = require("http");
+const https = require("https");
+const dns   = require("dns");
+
+// Force IPv4 DNS resolution globally
+dns.setDefaultResultOrder("ipv4first");
+
+// Create HTTPS agent that only uses IPv4
+const ipv4Agent = new https.Agent({ family: 4 });
+
 async function fetchGMGN(path) {
   const now  = Date.now();
   const wait = 1100 - (now - lastGMGNCall);
@@ -136,8 +146,8 @@ async function fetchGMGN(path) {
         "Accept":     "application/json",
         "Referer":    "https://gmgn.ai/",
       },
+      httpsAgent: ipv4Agent,
       timeout: 12000,
-      family: 4, // force IPv4 — GMGN does not support IPv6
     });
     return res.data;
   } catch(e) {
@@ -146,7 +156,9 @@ async function fetchGMGN(path) {
       log(`GMGN rate limit — waiting 10s`);
       await new Promise(r => setTimeout(r, 10000));
     } else if (status === 403) {
-      log(`GMGN 403 — check API key`);
+      log(`GMGN 403 — IP blocked or API key invalid`);
+    } else if (status === 404) {
+      log(`GMGN 404 — endpoint not found`);
     } else {
       log(`GMGN error: ${e.message}`);
     }
