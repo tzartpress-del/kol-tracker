@@ -88,12 +88,17 @@ function signalLabel(s) {
 }
 
 function hardFilter(token) {
-  if ((token.holder_count||0) < 30)  return false;
-  if ((token.liquidity||0) < 5000)   return false;
-  if ((token.rug_ratio||1) > 0.25)   return false;
-  if ((token.bundler_trader_amount_rate||1) > 0.35) return false;
-  if ((token.smart_degen_count||0) === 0) return false;
-  if (blacklist.has(token.creator||"")) return false;
+  // Only use fields confirmed in OpenAPI response
+  const liq = token.liquidity || 0;
+  const vol = token.volume || 0;
+  const mc  = token.market_cap || 0;
+  const chg = token.price_change_percent1h || 0;
+
+  if (liq < 3000)   return false;  // must have some liquidity
+  if (vol < 1000)   return false;  // must have some volume
+  if (mc < MC_MIN)  return false;  // below min market cap
+  if (mc > MC_MAX)  return false;  // above max market cap
+  if (chg < -80)    return false;  // dumping hard
   return true;
 }
 
@@ -570,8 +575,7 @@ async function scan() {
     ...kolTokens.map(t=>({...t,_type:"kol"})),
     ...pumpTokens.map(t=>({...t,_type:"pump"})),
   ];
-  // TEST MODE: bypass hardFilter to diagnose missing fields
-  const filtered=allTokens.filter(t=>t.address);
+  const filtered=allTokens.filter(t=>t._type==="ultra"||t._type==="pump"||hardFilter(t));
   log(`Tokens after filter: ${filtered.length}`);
   const aiResults=await Promise.all(filtered.map(t=>claudeFilter(t)));
   const scored=filtered
@@ -603,11 +607,11 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker TEST — No hardFilter + field debug");
+  log("KOL Tracker TEST v2 — Fixed hardFilter for OpenAPI fields");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
 
   await bot.sendMessage(CHAT_ID,
-    `🧪 *KOL Tracker TEST MODE Online*\n\n`+
+    `🧪 *KOL Tracker TEST v2 Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🤖 Claude AI filter active\n`+
