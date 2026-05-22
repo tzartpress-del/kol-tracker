@@ -7,6 +7,7 @@
   },
   "dependencies": {
     "node-telegram-bot-api": "^0.64.0",
-    "axios": "^1.6.0"
+    "axios": "^1.6.0",
+    "uuid": "^9.0.0"
   }
 }
