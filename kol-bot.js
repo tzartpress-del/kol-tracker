@@ -440,8 +440,8 @@ async function fetchGMGNSequential(paths) {
 // ─── KOL SIGNALS ─────────────────────────────────────────────────────────────
 async function getKOLSignals() {
   const paths = [
-    `/v1/tokens/sol/trending?interval=1h&orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
-    `/v1/tokens/sol/trending?interval=1h&orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
+    `/v1/tokens/trending?chain=sol&interval=1h&orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
+    `/v1/tokens/trending?chain=sol&interval=1h&orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
   ];
   const responses = await fetchGMGNSequential(paths);
   const seen = new Set(); const results = [];
@@ -474,8 +474,7 @@ async function getKOLSignals() {
 // ─── PUMPFUN PRE-BOND ─────────────────────────────────────────────────────────
 async function getPumpSignals() {
   const paths = [
-    `/v1/trenches/sol?type=near_completion&orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`,
-    `/v1/trenches/sol?type=near_completion&orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&limit=100`,
+    `/v1/trenches/completing?chain=sol&orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`,
   ];
   const responses = await fetchGMGNSequential(paths);
   const seen = new Set(); const results = [];
@@ -508,7 +507,7 @@ async function getPumpSignals() {
 // ─── ULTRA EARLY ─────────────────────────────────────────────────────────────
 async function getUltraSignals() {
   const paths = [
-    `/v1/trenches/sol?type=new_creation&orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
+    `/v1/trenches/new?chain=sol&orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
   ];
   const responses = await fetchGMGNSequential(paths);
   const seen = new Set(); const results = [];
