@@ -294,15 +294,30 @@ async function fetchOpenAPI(subPath, params={}, method="GET") {
   try {
     const ts=Math.floor(Date.now()/1000);
     const cid=uuidv4();
-    const allParams={...params,timestamp:String(ts),client_id:cid};
-    const qs=Object.entries(allParams).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+    // For GET: params go in query string
+    // For POST: auth params go in query string, data params go in body
+    const authParams={timestamp:String(ts),client_id:cid};
+    const qs=Object.entries(authParams).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
     const url=`https://openapi.gmgn.ai${subPath}?${qs}`;
-    const headers={"X-APIKEY":GMGN_API_KEY,"Accept":"application/json"};
-    const res=method==="POST"
-      ? await axiosAPI.post(url,{},{headers:{...headers,"Content-Type":"application/json"}})
-      : await axiosAPI.get(url,{headers});
+    const headers={"X-APIKEY":GMGN_API_KEY,"Accept":"application/json","Content-Type":"application/json"};
+
+    let res;
+    if (method==="POST") {
+      // Send params as JSON body for POST
+      res=await axiosAPI.post(url, params, {headers});
+    } else {
+      // Send params as query string for GET
+      const allParams={...params,...authParams};
+      const fullQs=Object.entries(allParams).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+      const getUrl=`https://openapi.gmgn.ai${subPath}?${fullQs}`;
+      res=await axiosAPI.get(getUrl,{headers});
+    }
+
     if (res.status===405&&method==="GET") return fetchOpenAPI(subPath,params,"POST");
-    if (res.status!==200||typeof res.data==="string") return null;
+    if (res.status!==200||typeof res.data==="string") {
+      log(`OpenAPI ${res.status}: ${JSON.stringify(res.data)?.slice(0,100)}`);
+      return null;
+    }
     if (res.data?.code!==0) { log(`OpenAPI err: ${res.data?.error} ${res.data?.message}`); return null; }
     log(`OpenAPI OK: ${subPath}`);
     return res.data;
@@ -372,7 +387,7 @@ function processKOLList(list, seen, results) {
 async function getPumpSignals() {
   const seen=new Set(), results=[];
 
-  // Try public API
+  // Try public API first
   const publicURLs=[
     `https://gmgn.ai/defi/quotation/v1/rank/sol/pump?orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`,
     `https://gmgn.ai/api/v1/mutil_window_token_list/sol?type=near_completion&orderby=volume&direction=desc&limit=50`,
@@ -387,28 +402,38 @@ async function getPumpSignals() {
     processPumpList(list,seen,results);
   }
 
-  // Fall back to OpenAPI /v1/trenches
+  // Fall back to OpenAPI — POST with correct body
   if (!publicWorked) {
     log("Public Pump API failed — using OpenAPI fallback");
-    const data=await fetchOpenAPI("/v1/trenches",{chain:"sol"});
+    // POST body: type near_completion returns under data.pump per docs
+    const data=await fetchOpenAPI("/v1/trenches",{
+      chain:"sol",
+      type:["near_completion"],
+      limit:80
+    },"POST");
     if (data) {
-      const pumpList=data?.data?.pump||data?.data?.completing||[];
+      const pumpList=data?.data?.pump||[];
+      log(`Trenches pump list length: ${pumpList.length}`);
       processPumpList(pumpList,seen,results);
     }
   }
 
-  return results.sort((a,b)=>(b.volume||0)-(a.volume||0)).slice(0,10);
+  return results.sort((a,b)=>(b.volume_1h||b.volume||0)-(a.volume_1h||a.volume||0)).slice(0,10);
 }
 
 function processPumpList(list, seen, results) {
   for (const t of list) {
     if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
     seen.add(t.address);
+    // Trenches uses different field names per docs
     const progress=t.launchpad_status?.bonding_curve_percentage||t.graduation_progress||t.progress||0;
-    const volume=t.volume||t.volume_24h||0;
-    const holders=t.holder_count||t.holders||0;
-    if (progress>=PUMP_MIN_PROGRESS&&progress<=PUMP_MAX_PROGRESS&&volume>=PUMP_MIN_VOLUME&&holders>=PUMP_MIN_HOLDERS&&(t.rug_ratio||0)<0.3&&!t.is_wash_trading)
-      results.push({...t,alertType:"PUMP",progress});
+    const volume=t.volume_1h||t.volume_24h||t.volume||0;
+    const holders=t.holder_count||0;
+    const mc=t.usd_market_cap||t.market_cap||0;
+    if (progress>=PUMP_MIN_PROGRESS&&progress<=PUMP_MAX_PROGRESS&&
+        volume>=PUMP_MIN_VOLUME&&holders>=PUMP_MIN_HOLDERS&&
+        (t.rug_ratio||0)<0.3&&!t.is_wash_trading)
+      results.push({...t,alertType:"PUMP",progress,market_cap:mc,volume:volume});
   }
 }
 
@@ -416,7 +441,7 @@ function processPumpList(list, seen, results) {
 async function getUltraSignals() {
   const seen=new Set(), results=[];
 
-  // Try public API
+  // Try public API first
   const publicURLs=[
     `https://gmgn.ai/defi/quotation/v1/rank/sol/pump?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
     `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/5m?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
@@ -431,12 +456,17 @@ async function getUltraSignals() {
     processUltraList(list,seen,results);
   }
 
-  // Fall back to OpenAPI
+  // Fall back to OpenAPI — POST with correct body
   if (!publicWorked) {
     log("Public Ultra API failed — using OpenAPI fallback");
-    const data=await fetchOpenAPI("/v1/trenches",{chain:"sol"});
+    const data=await fetchOpenAPI("/v1/trenches",{
+      chain:"sol",
+      type:["new_creation"],
+      limit:80
+    },"POST");
     if (data) {
-      const newList=data?.data?.new_creation||data?.data?.new||[];
+      const newList=data?.data?.new_creation||[];
+      log(`Trenches new_creation list length: ${newList.length}`);
       processUltraList(newList,seen,results);
     }
   }
@@ -448,16 +478,22 @@ function processUltraList(list, seen, results) {
   for (const t of list) {
     if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
     seen.add(t.address);
-    const ageMs=t.open_timestamp?Date.now()-t.open_timestamp*1000:null;
+    // Trenches uses created_timestamp, not open_timestamp
+    const ageMs=t.created_timestamp?(Date.now()-t.created_timestamp*1000):
+                t.open_timestamp?(Date.now()-t.open_timestamp*1000):null;
     if (!ageMs||ageMs>ULTRA_MAX_AGE_MS) continue;
     const progress=t.launchpad_status?.bonding_curve_percentage||t.progress||0;
-    const volume=t.volume||t.volume_5m||0;
-    const holders=t.holder_count||t.holders||0;
-    const buys=t.buy_5m||t.swaps_5m||t.txns_5m?.buys||0;
-    const sells=t.sell_5m||t.txns_5m?.sells||0;
+    const volume=t.volume_1h||t.volume_24h||t.volume||t.volume_5m||0;
+    const holders=t.holder_count||0;
+    const buys=t.buys_24h||t.buy_5m||t.swaps_5m||0;
+    const sells=t.sells_24h||t.sell_5m||0;
     const buyRatio=sells>0?buys/sells:buys;
-    if (progress>=3&&progress<=60&&volume>=ULTRA_MIN_VOLUME&&holders>=ULTRA_MIN_HOLDERS&&buyRatio>=ULTRA_MIN_BUY_RATIO&&(t.rug_ratio||0)<0.2&&!t.is_wash_trading)
-      results.push({...t,alertType:"ULTRA_EARLY",ageMs,progress,buys,sells,buyRatio});
+    const mc=t.usd_market_cap||t.market_cap||0;
+    if (progress>=3&&progress<=60&&
+        volume>=ULTRA_MIN_VOLUME&&holders>=ULTRA_MIN_HOLDERS&&
+        buyRatio>=ULTRA_MIN_BUY_RATIO&&
+        (t.rug_ratio||0)<0.2&&!t.is_wash_trading)
+      results.push({...t,alertType:"ULTRA_EARLY",ageMs,progress,buys,sells,buyRatio,market_cap:mc,volume:volume});
   }
 }
 
@@ -607,11 +643,11 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker TEST v2 — Fixed hardFilter for OpenAPI fields");
+  log("KOL Tracker TEST v3 — Fixed trenches POST body + field names");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
 
   await bot.sendMessage(CHAT_ID,
-    `🧪 *KOL Tracker TEST v2 Online*\n\n`+
+    `🧪 *KOL Tracker TEST v3 Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🤖 Claude AI filter active\n`+
