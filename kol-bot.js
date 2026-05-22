@@ -412,14 +412,10 @@ async function getPumpSignals() {
   // Fall back to OpenAPI — POST with correct body
   if (!publicWorked) {
     log("Public Pump API failed — using OpenAPI fallback");
-    // POST body: type near_completion returns under data.pump per docs
-    const data=await fetchOpenAPI("/v1/trenches",{
-      chain:"sol",
-      type:["near_completion"],
-      limit:80
-    },"POST");
+    const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",limit:80},"POST");
     if (data) {
-      const pumpList=data?.data?.pump||[];
+      log(`Trenches ALL keys: ${JSON.stringify(Object.keys(data?.data||{}))}`);
+      const pumpList=data?.data?.pump||data?.data?.near_completion||data?.data?.completing||[];
       log(`Trenches pump list length: ${pumpList.length}`);
       processPumpList(pumpList,seen,results);
     }
@@ -466,13 +462,10 @@ async function getUltraSignals() {
   // Fall back to OpenAPI — POST with correct body
   if (!publicWorked) {
     log("Public Ultra API failed — using OpenAPI fallback");
-    const data=await fetchOpenAPI("/v1/trenches",{
-      chain:"sol",
-      type:["new_creation"],
-      limit:80
-    },"POST");
+    const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",limit:80},"POST");
     if (data) {
-      const newList=data?.data?.new_creation||[];
+      log(`Trenches ALL keys (ultra): ${JSON.stringify(Object.keys(data?.data||{}))}`);
+      const newList=data?.data?.new_creation||data?.data?.new||data?.data?.newCreation||[];
       log(`Trenches new_creation list length: ${newList.length}`);
       processUltraList(newList,seen,results);
     }
@@ -650,11 +643,11 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker TEST v4 — Fixed chain in POST query string");
+  log("KOL Tracker TEST v5 — No type filter, log all trenches keys");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
 
   await bot.sendMessage(CHAT_ID,
-    `🧪 *KOL Tracker TEST v4 Online*\n\n`+
+    `🧪 *KOL Tracker TEST v5 Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🤖 Claude AI filter active\n`+
