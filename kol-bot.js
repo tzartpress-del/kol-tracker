@@ -306,6 +306,8 @@ async function getKOLSignals() {
   ]) {
     const data=await fetchGMGN("/v1/market/rank",params);
     if (!data) continue;
+    log(`RANK response keys: ${JSON.stringify(Object.keys(data?.data||{}))}`);
+    log(`RANK list length: ${(data?.data?.rank||data?.data?.tokens||data?.data||[]).length}`);
     const list=data?.data?.rank||data?.data?.tokens||data?.data||[];
     for (const t of (Array.isArray(list)?list:[])) {
       if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
@@ -326,7 +328,8 @@ async function getTrenchesSignals() {
   // Only chain is required per docs — no extra params
   const data=await fetchGMGN("/v1/trenches",{chain:"sol"});
   if (!data) return {pump:[],ultra:[]};
-
+  log(`TRENCHES response keys: ${JSON.stringify(Object.keys(data?.data||{}))}`);
+  log(`TRENCHES pump:${(data?.data?.pump||[]).length} new:${(data?.data?.new_creation||[]).length} completed:${(data?.data?.completed||[]).length}`);
   const pumpList = data?.data?.pump        || [];
   const newList  = data?.data?.new_creation || [];
   const pump=[], ultra=[];
@@ -462,12 +465,12 @@ async function scan() {
 }
 
 async function main() {
-  log("KOL Tracker GOD MODE — Optimized Filters");
+  log("KOL Tracker GOD MODE DEBUG");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `*KOL Tracker GOD MODE Online*\n\nEndpoints:\n/v1/market/rank ✅\n/v1/trenches (405 fix)\n\nScan: 60s`,
+    `*KOL Tracker GOD MODE DEBUG Online*\n\nEndpoints:\n/v1/market/rank ✅\n/v1/trenches (405 fix)\n\nScan: 60s`,
     {parse_mode:"Markdown"}
   );
 
@@ -476,3 +479,4 @@ async function main() {
 }
 
 main().catch(e=>{log(`Fatal: ${e.message}`);process.exit(1);});
+9
