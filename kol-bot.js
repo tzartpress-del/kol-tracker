@@ -303,8 +303,15 @@ async function fetchOpenAPI(subPath, params={}, method="GET") {
 
     let res;
     if (method==="POST") {
-      // Send params as JSON body for POST
-      res=await axiosAPI.post(url, params, {headers});
+      // For POST: chain goes in BOTH query string and body
+      // Auth params (timestamp, client_id) in query string
+      // Data params in JSON body
+      // chain must also be in query string per API requirements
+      const chain = params.chain || "sol";
+      const postQs = `${qs}&chain=${chain}`;
+      const postUrl = `https://openapi.gmgn.ai${subPath}?${postQs}`;
+      log(`POST ${postUrl.slice(0,100)} body:${JSON.stringify(params)}`);
+      res=await axiosAPI.post(postUrl, params, {headers});
     } else {
       // Send params as query string for GET
       const allParams={...params,...authParams};
@@ -643,11 +650,11 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker TEST v3 — Fixed trenches POST body + field names");
+  log("KOL Tracker TEST v4 — Fixed chain in POST query string");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
 
   await bot.sendMessage(CHAT_ID,
-    `🧪 *KOL Tracker TEST v3 Online*\n\n`+
+    `🧪 *KOL Tracker TEST v4 Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🤖 Claude AI filter active\n`+
