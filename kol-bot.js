@@ -3,7 +3,6 @@ const axios = require("axios");
 const https = require("https");
 const dns   = require("dns");
 const { v4: uuidv4 } = require("uuid");
-const crypto = require("crypto");
 
 process.on("unhandledRejection", console.error);
 process.on("uncaughtException", console.error);
@@ -14,7 +13,6 @@ const CHAT_ID          = process.env.CHAT_ID;
 const HELIUS_API_KEY   = process.env.HELIUS_API_KEY;
 const CLAUDE_API_KEY   = process.env.CLAUDE_API_KEY;
 const GMGN_API_KEY     = process.env.GMGN_API_KEY;
-const GMGN_PRIVATE_KEY = process.env.GMGN_PRIVATE_KEY;
 
 const MC_MIN              = 15000;
 const MC_MAX              = 150000;
@@ -71,54 +69,11 @@ function getVelocity(t) {
   const v5 = t.volume_5m||0, v1 = t.volume||0;
   return parseFloat((v1>0?(v5*12)/v1:0).toFixed(2));
 }
-
-// ─── SIGNING ─────────────────────────────────────────────────────────────────
-// GMGN signature: sign("{subPath}:{sorted_query_no_filters}::{timestamp}")
-// filters[] params are NOT included in signature per GMGN docs
-function buildSignature(subPath, queryObj) {
-  if (!GMGN_PRIVATE_KEY) return null;
-  try {
-    // Only include non-array params in signature (exclude filters[])
-    const sigParams = Object.keys(queryObj)
-      .filter(k => !k.startsWith("filters"))
-      .sort()
-      .map(k => `${k}=${queryObj[k]}`)
-      .join("&");
-
-    const timestamp = queryObj["timestamp"];
-    const message = `${subPath}:${sigParams}::${timestamp}`;
-    log(`Sign msg: ${message.slice(0,100)}`);
-
-    const pk = GMGN_PRIVATE_KEY.trim();
-
-    if (pk.includes("-----BEGIN")) {
-      try {
-        return crypto.sign(null, Buffer.from(message), { key: pk, format: "pem" }).toString("base64");
-      } catch(e) {
-        return crypto.sign("sha256", Buffer.from(message), { key: pk, padding: crypto.constants.RSA_PKCS1_PSS_PADDING }).toString("base64");
-      }
-    }
-    // Raw base64 Ed25519
-    try {
-      const keyBuf = Buffer.from(pk, "base64");
-      const privKey = crypto.createPrivateKey({ key: keyBuf, format: "der", type: "pkcs8" });
-      return crypto.sign(null, Buffer.from(message), privKey).toString("base64");
-    } catch(e) {
-      log(`Ed25519 pkcs8 fail: ${e.message}`);
-      // Try as raw 64-byte Ed25519 seed
-      try {
-        const seed = Buffer.from(pk, "base64");
-        const privKey = crypto.createPrivateKey({ key: Buffer.concat([Buffer.from("302e020100300506032b657004220420","hex"), seed]), format: "der", type: "pkcs8" });
-        return crypto.sign(null, Buffer.from(message), privKey).toString("base64");
-      } catch(e2) {
-        log(`Ed25519 seed fail: ${e2.message}`);
-        return null;
-      }
-    }
-  } catch(e) {
-    log(`Sign error: ${e.message}`);
-    return null;
-  }
+function signalLabel(s) {
+  if (s>=12) return "ULTRA HIGH";
+  if (s>=8)  return "HIGH";
+  if (s>=5)  return "MEDIUM";
+  return "LOW";
 }
 
 function hardFilter(token) {
@@ -134,9 +89,9 @@ function hardFilter(token) {
 
 function calcFinalScore(token, aiConf, insiderCount) {
   let s = 0;
-  const smart = token.smart_degen_count||0, kol = token.renowned_count||0;
-  const rug = token.rug_ratio||1, liq = token.liquidity||0;
-  const buys = token.buy_5m||token.swaps_5m||0, sells = token.sell_5m||0;
+  const smart=token.smart_degen_count||0, kol=token.renowned_count||0;
+  const rug=token.rug_ratio||1, liq=token.liquidity||0;
+  const buys=token.buy_5m||token.swaps_5m||0, sells=token.sell_5m||0;
   if (smart>=3) s+=3; else if (smart>=1) s+=2;
   if (kol>=2) s+=2; else if (kol>=1) s+=1;
   if (liq>15000) s+=2;
@@ -155,28 +110,21 @@ function calcFinalScore(token, aiConf, insiderCount) {
   return s;
 }
 
-function signalLabel(s) {
-  if (s>=12) return "ULTRA HIGH";
-  if (s>=8)  return "HIGH";
-  if (s>=5)  return "MEDIUM";
-  return "LOW";
-}
-
 bot.on("callback_query", async (q) => {
   try {
     if (q.data?.startsWith("skip_")) {
-      await bot.answerCallbackQuery(q.id, { text: "Skipped!" });
-      await bot.editMessageReplyMarkup({ inline_keyboard: [[{text:"Skipped",callback_data:"done"}]] }, { chat_id: q.message.chat.id, message_id: q.message.message_id });
+      await bot.answerCallbackQuery(q.id, { text:"Skipped!" });
+      await bot.editMessageReplyMarkup({ inline_keyboard:[[{text:"Skipped",callback_data:"done"}]] }, { chat_id:q.message.chat.id, message_id:q.message.message_id });
     }
     if (q.data==="stats") {
       await bot.answerCallbackQuery(q.id);
-      const s = botStats;
+      const s=botStats;
       await bot.sendMessage(CHAT_ID,
-        `*Stats*\nKOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n` +
-        `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n` +
-        `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n` +
-        `Claude: ${claudeCallsToday}/${CLAUDE_DAILY_LIMIT}`,
-        { parse_mode: "Markdown" }
+        `*Stats*\nKOL:${s.kol.alerts} 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
+        `Pump:${s.pump.alerts} 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
+        `Ultra:${s.ultra.alerts} 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
+        `Claude:${claudeCallsToday}/${CLAUDE_DAILY_LIMIT}`,
+        { parse_mode:"Markdown" }
       );
     }
   } catch(e) {}
@@ -184,29 +132,29 @@ bot.on("callback_query", async (q) => {
 
 async function claudeFilter(token) {
   if (Date.now()>claudeResetTime) { claudeCallsToday=0; claudeResetTime=Date.now()+86400000; }
-  const cached = claudeCache.get(token.address);
-  if (cached && Date.now()-cached.ts<1800000) return cached.result;
+  const cached=claudeCache.get(token.address);
+  if (cached&&Date.now()-cached.ts<1800000) return cached.result;
   const rug=token.rug_ratio||0, smart=token.smart_degen_count||0, liq=token.liquidity||0;
   if (rug>0.5)             return { decision:"REJECT", reason:"Rug>50%",    risk:"VERY HIGH", confidence:99 };
   if (liq<3000)            return { decision:"REJECT", reason:"Low liq",    risk:"VERY HIGH", confidence:99 };
   if (token.is_wash_trading) return { decision:"REJECT", reason:"Wash",     risk:"VERY HIGH", confidence:99 };
-  if (smart>=3 && rug<0.1) {
-    const r = { decision:"APPROVE", reason:"Strong smart money", risk:"LOW", confidence:92 };
-    claudeCache.set(token.address, { result:r, ts:Date.now() }); return r;
+  if (smart>=3&&rug<0.1) {
+    const r={decision:"APPROVE",reason:"Strong smart money",risk:"LOW",confidence:92};
+    claudeCache.set(token.address,{result:r,ts:Date.now()}); return r;
   }
   if (!CLAUDE_API_KEY||claudeCallsToday>=CLAUDE_DAILY_LIMIT)
-    return { decision:"APPROVE", reason:"AI limit", risk:"MEDIUM", confidence:50 };
+    return {decision:"APPROVE",reason:"AI limit",risk:"MEDIUM",confidence:50};
   try {
     claudeCallsToday++;
-    const res = await axios.post("https://api.anthropic.com/v1/messages",
-      { model:"claude-haiku-4-5-20251001", max_tokens:80, messages:[{ role:"user", content:
-        `Solana memecoin. ${token.symbol} MC:$${token.market_cap} Liq:$${liq} Smart:${smart} Rug:${(rug*100).toFixed(0)}%\nREJECT only rug>40% or no liq. JSON: {"decision":"APPROVE","reason":"brief","risk":"LOW","confidence":75}` }] },
-      { headers:{ "x-api-key":CLAUDE_API_KEY, "anthropic-version":"2023-06-01", "content-type":"application/json" }, timeout:10000 }
+    const res=await axios.post("https://api.anthropic.com/v1/messages",
+      {model:"claude-haiku-4-5-20251001",max_tokens:80,messages:[{role:"user",content:
+        `Solana memecoin. ${token.symbol} MC:$${token.market_cap} Liq:$${liq} Smart:${smart} Rug:${(rug*100).toFixed(0)}%\nREJECT only rug>40% or no liq. JSON: {"decision":"APPROVE","reason":"brief","risk":"LOW","confidence":75}`}]},
+      {headers:{"x-api-key":CLAUDE_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"},timeout:10000}
     );
-    const r = JSON.parse((res.data?.content?.[0]?.text||"").replace(/```json|```/g,"").trim());
-    claudeCache.set(token.address, { result:r, ts:Date.now() });
+    const r=JSON.parse((res.data?.content?.[0]?.text||"").replace(/```json|```/g,"").trim());
+    claudeCache.set(token.address,{result:r,ts:Date.now()});
     return r;
-  } catch(e) { return { decision:"APPROVE", reason:"AI unavailable", risk:"MEDIUM", confidence:50 }; }
+  } catch(e) { return {decision:"APPROVE",reason:"AI unavailable",risk:"MEDIUM",confidence:50}; }
 }
 
 const INSIDER_WALLETS = {
@@ -220,12 +168,12 @@ const INSIDER_WALLETS = {
 
 async function pollInsiderWallets() {
   if (!HELIUS_API_KEY) return;
-  for (const [wallet, name] of Object.entries(INSIDER_WALLETS)) {
+  for (const [wallet,name] of Object.entries(INSIDER_WALLETS)) {
     try {
-      const res = await axios.get(`https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${HELIUS_API_KEY}&limit=5&type=SWAP`, { timeout:8000 });
-      const txs = res.data||[];
+      const res=await axios.get(`https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${HELIUS_API_KEY}&limit=5&type=SWAP`,{timeout:8000});
+      const txs=res.data||[];
       if (!txs.length) continue;
-      const newTxs = lastSig[wallet] ? txs.filter(t=>t.signature!==lastSig[wallet]) : txs.slice(0,2);
+      const newTxs=lastSig[wallet]?txs.filter(t=>t.signature!==lastSig[wallet]):txs.slice(0,2);
       if (newTxs.length) lastSig[wallet]=txs[0].signature;
       for (const tx of newTxs) {
         const WSOL="So11111111111111111111111111111111111111112";
@@ -233,7 +181,6 @@ async function pollInsiderWallets() {
         if (!recv?.mint) continue;
         if (!insiderBuys[recv.mint]) insiderBuys[recv.mint]={};
         insiderBuys[recv.mint][name]=Date.now();
-        log(`Insider ${name} bought ${recv.mint.slice(0,8)}`);
       }
     } catch(e) {}
     await new Promise(r=>setTimeout(r,500));
@@ -247,127 +194,92 @@ async function pollInsiderWallets() {
 
 async function getTokenPrice(mint) {
   try {
-    const res = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`, { timeout:8000 });
+    const res=await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${mint}`,{timeout:8000});
     const pairs=(res.data?.pairs||[]).filter(p=>p.chainId==="solana");
     if (!pairs.length) return null;
     pairs.sort((a,b)=>(b.liquidity?.usd||0)-(a.liquidity?.usd||0));
-    return { price:parseFloat(pairs[0].priceUsd||0), mc:pairs[0].fdv||0, liquidity:pairs[0].liquidity?.usd||0, sells:pairs[0].txns?.h1?.sells||0, buys:pairs[0].txns?.h1?.buys||0 };
+    return {price:parseFloat(pairs[0].priceUsd||0),mc:pairs[0].fdv||0,liquidity:pairs[0].liquidity?.usd||0,sells:pairs[0].txns?.h1?.sells||0,buys:pairs[0].txns?.h1?.buys||0};
   } catch(e) { return null; }
 }
 
-async function trackPerformance(mint, alertPrice, alertMC, symbol, alertMsgId, signalType) {
-  performanceTracker.set(mint, { alertPrice, alertMC, symbol, alertTime:Date.now(), alertMsgId, signalType, peakX:1, notified2x:false, notified5x:false, notified10x:false });
-  const interval = setInterval(async () => {
-    const tracker = performanceTracker.get(mint);
-    if (!tracker) { clearInterval(interval); return; }
+async function trackPerformance(mint,alertPrice,alertMC,symbol,alertMsgId,signalType) {
+  performanceTracker.set(mint,{alertPrice,alertMC,symbol,alertTime:Date.now(),alertMsgId,signalType,peakX:1,notified2x:false,notified5x:false,notified10x:false});
+  const interval=setInterval(async()=>{
+    const tracker=performanceTracker.get(mint);
+    if (!tracker){clearInterval(interval);return;}
     if (Date.now()-tracker.alertTime>86400000) {
-      const v = tracker.peakX>=10?"MOONSHOT":tracker.peakX>=5?"BANGER":tracker.peakX>=2?"WIN":"RUG";
-      await bot.sendMessage(CHAT_ID, `*24hr* $${symbol} Peak:${tracker.peakX.toFixed(2)}x — ${v}`, { parse_mode:"Markdown" }).catch(()=>{});
-      performanceTracker.delete(mint); clearInterval(interval); return;
+      const v=tracker.peakX>=10?"MOONSHOT":tracker.peakX>=5?"BANGER":tracker.peakX>=2?"WIN":"RUG";
+      await bot.sendMessage(CHAT_ID,`*24hr* $${symbol} Peak:${tracker.peakX.toFixed(2)}x — ${v}`,{parse_mode:"Markdown"}).catch(()=>{});
+      performanceTracker.delete(mint);clearInterval(interval);return;
     }
-    const cur = await getTokenPrice(mint);
+    const cur=await getTokenPrice(mint);
     if (!cur?.price||!alertPrice) return;
-    const x = cur.price/alertPrice;
+    const x=cur.price/alertPrice;
     if (x>tracker.peakX) tracker.peakX=x;
-    const stats = botStats[signalType]||botStats.kol;
-    if (x>=10&&!tracker.notified10x) { tracker.notified10x=true; stats.hits10x++; await bot.sendMessage(CHAT_ID,`*10x!* $${symbol} ${x.toFixed(2)}x`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{}); }
-    else if (x>=5&&!tracker.notified5x) { tracker.notified5x=true; stats.hits5x++; await bot.sendMessage(CHAT_ID,`*5x!* $${symbol} ${x.toFixed(2)}x`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{}); }
-    else if (x>=2&&!tracker.notified2x) { tracker.notified2x=true; stats.hits2x++; await bot.sendMessage(CHAT_ID,`*2x!* $${symbol} ${x.toFixed(2)}x`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{}); }
-    if (cur.liquidity<2000&&tracker.peakX>1.5) { await bot.sendMessage(CHAT_ID,`*LIQ WARNING* $${symbol} exit!`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{}); performanceTracker.delete(mint); clearInterval(interval); }
-  }, 3*60*1000);
+    const stats=botStats[signalType]||botStats.kol;
+    if (x>=10&&!tracker.notified10x){tracker.notified10x=true;stats.hits10x++;await bot.sendMessage(CHAT_ID,`*10x!* $${symbol} ${x.toFixed(2)}x`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});}
+    else if (x>=5&&!tracker.notified5x){tracker.notified5x=true;stats.hits5x++;await bot.sendMessage(CHAT_ID,`*5x!* $${symbol} ${x.toFixed(2)}x`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});}
+    else if (x>=2&&!tracker.notified2x){tracker.notified2x=true;stats.hits2x++;await bot.sendMessage(CHAT_ID,`*2x!* $${symbol} ${x.toFixed(2)}x`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});}
+    if (cur.liquidity<2000&&tracker.peakX>1.5){await bot.sendMessage(CHAT_ID,`*LIQ WARNING* $${symbol} exit!`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});performanceTracker.delete(mint);clearInterval(interval);}
+  },3*60*1000);
 }
 
-// ─── GMGN FETCH ───────────────────────────────────────────────────────────────
-const GMGN_GAP_MS = 2000;
-let gmgnBlocked = false, gmgnBlockUntil = 0;
-const ipv4Agent = new https.Agent({ family:4, keepAlive:true });
-const axiosGMGN = axios.create({ httpsAgent:ipv4Agent, timeout:20000, maxRedirects:2, validateStatus:()=>true });
+// ─── GMGN FETCH — Standard Auth only (no signature for market/trenches) ───────
+const GMGN_GAP_MS=2000;
+let gmgnBlocked=false,gmgnBlockUntil=0;
+const ipv4Agent=new https.Agent({family:4,keepAlive:true});
+const axiosGMGN=axios.create({httpsAgent:ipv4Agent,timeout:20000,maxRedirects:2,validateStatus:()=>true});
 
-async function fetchGMGN(path) {
-  if (gmgnBlocked&&Date.now()<gmgnBlockUntil) { log(`GMGN blocked ${Math.round((gmgnBlockUntil-Date.now())/1000)}s`); return null; }
+async function fetchGMGN(subPath, params={}) {
+  if (gmgnBlocked&&Date.now()<gmgnBlockUntil){log(`GMGN blocked ${Math.round((gmgnBlockUntil-Date.now())/1000)}s`);return null;}
   gmgnBlocked=false;
   const wait=GMGN_GAP_MS-(Date.now()-lastGMGNCall);
   if (wait>0) await new Promise(r=>setTimeout(r,wait));
   lastGMGNCall=Date.now();
 
   try {
+    // Standard auth: only X-APIKEY + timestamp + client_id required
+    // NO X-Signature needed for /v1/market/* and /v1/trenches
     const timestamp=Math.floor(Date.now()/1000);
     const client_id=uuidv4();
 
-    // Split path and query
-    const qIdx = path.indexOf("?");
-    const subPath = qIdx>=0 ? path.slice(0,qIdx) : path;
-    const rawQuery = qIdx>=0 ? path.slice(qIdx+1) : "";
+    const allParams={ ...params, timestamp:String(timestamp), client_id };
+    const qs=Object.entries(allParams).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+    const url=`https://openapi.gmgn.ai${subPath}?${qs}`;
 
-    // Parse query into object — keep filters[] as-is for URL but exclude from signature
-    const queryObj = {};
-    const filterValues = [];
-    if (rawQuery) {
-      rawQuery.split("&").forEach(pair => {
-        const eqIdx = pair.indexOf("=");
-        if (eqIdx<0) return;
-        const k = pair.slice(0,eqIdx);
-        const v = pair.slice(eqIdx+1);
-        if (k==="filters[]") { filterValues.push(v); }
-        else { queryObj[k]=v; }
-      });
-    }
-    queryObj["timestamp"] = String(timestamp);
-    queryObj["client_id"] = client_id;
+    log(`GET ${url.slice(0,120)}`);
 
-    // Build signature (no filters[])
-    const signature = buildSignature(subPath, queryObj);
+    const res=await axiosGMGN.get(url,{headers:{"X-APIKEY":GMGN_API_KEY,"Accept":"application/json"}});
 
-    // Build final URL — sorted non-filter params + filter params at end
-    const sortedPairs = Object.keys(queryObj).sort().map(k=>`${k}=${encodeURIComponent(queryObj[k])}`);
-    const filterPairs = filterValues.map(v=>`filters[]=${encodeURIComponent(v)}`);
-    const finalQuery = [...sortedPairs, ...filterPairs].join("&");
-    const url = `https://openapi.gmgn.ai${subPath}?${finalQuery}`;
-
-    log(`Fetching: ${url.slice(0,120)}`);
-
-    const headers = { "X-APIKEY": GMGN_API_KEY, "Accept": "application/json" };
-    if (signature) headers["X-Signature"] = signature;
-
-    const res = await axiosGMGN.get(url, { headers });
-
-    if (res.status===429) { log("GMGN 429"); gmgnBlocked=true; gmgnBlockUntil=Date.now()+60000; return null; }
-    if (res.status===403) { log("GMGN 403"); gmgnBlocked=true; gmgnBlockUntil=Date.now()+300000; return null; }
-    if (res.status===401) { log(`GMGN 401: ${JSON.stringify(res.data)?.slice(0,200)}`); return null; }
-    if (res.status===404) { log(`GMGN 404: ${subPath}`); return null; }
-    if (res.status!==200) { log(`GMGN ${res.status}: ${JSON.stringify(res.data)?.slice(0,100)}`); return null; }
-    if (typeof res.data==="string") { log("GMGN HTML"); gmgnBlocked=true; gmgnBlockUntil=Date.now()+120000; return null; }
-    if (res.data?.code!==undefined&&res.data.code!==0) { log(`GMGN err: ${res.data.error} ${res.data.message}`); return null; }
+    if (res.status===429){log("GMGN 429");gmgnBlocked=true;gmgnBlockUntil=Date.now()+60000;return null;}
+    if (res.status===403){log("GMGN 403");gmgnBlocked=true;gmgnBlockUntil=Date.now()+300000;return null;}
+    if (res.status===401){log(`GMGN 401: ${JSON.stringify(res.data)?.slice(0,200)}`);return null;}
+    if (res.status===404){log(`GMGN 404: ${subPath} — full response: ${JSON.stringify(res.data)?.slice(0,200)}`);return null;}
+    if (res.status!==200){log(`GMGN ${res.status}: ${JSON.stringify(res.data)?.slice(0,100)}`);return null;}
+    if (typeof res.data==="string"){log("GMGN HTML response");gmgnBlocked=true;gmgnBlockUntil=Date.now()+120000;return null;}
+    if (res.data?.code!==undefined&&res.data.code!==0){log(`GMGN err: ${res.data.error} ${res.data.message}`);return null;}
 
     log(`GMGN OK: ${subPath}`);
     return res.data;
-  } catch(e) { log(`GMGN fetch: ${e.message}`); return null; }
+  } catch(e){log(`GMGN fetch: ${e.message}`);return null;}
 }
 
-async function fetchGMGNSequential(paths) {
-  const results=[];
-  for (const p of paths) results.push(await fetchGMGN(p));
-  return results;
-}
-
-function getList(data) {
-  if (!data) return [];
-  const d = data.data;
-  if (Array.isArray(d?.rank)) return d.rank;
-  if (Array.isArray(d?.tokens)) return d.tokens;
-  if (Array.isArray(d?.list)) return d.list;
-  if (Array.isArray(d)) return d;
-  return [];
-}
-
+// ─── KOL SIGNALS — uses /v1/market/rank ──────────────────────────────────────
 async function getKOLSignals() {
-  const responses = await fetchGMGNSequential([
-    `/v1/market/trending_tokens?chain=sol&interval=1h&orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
-    `/v1/market/trending_tokens?chain=sol&interval=1h&orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
-  ]);
-  const seen=new Set(), results=[];
-  for (const data of responses) {
-    for (const t of getList(data)) {
+  const results=[];
+  const seen=new Set();
+
+  // Fetch two rank queries sequentially
+  const queries=[
+    {chain:"sol",interval:"1h",orderby:"smart_degen_count",direction:"desc",limit:"100"},
+    {chain:"sol",interval:"1h",orderby:"open_timestamp",direction:"desc",limit:"100"},
+  ];
+
+  for (const params of queries) {
+    const data=await fetchGMGN("/v1/market/rank",params);
+    if (!data) continue;
+    const list=data?.data?.rank||data?.data?.tokens||data?.data||[];
+    for (const t of (Array.isArray(list)?list:[])) {
       if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
       seen.add(t.address);
       const mc=t.market_cap||0;
@@ -375,70 +287,67 @@ async function getKOLSignals() {
       const isNew=tokenAge!==null&&tokenAge<=MAX_TOKEN_AGE_MS;
       const isReentry=!isNew&&(t.volume||0)>=REENTRY_MIN_VOLUME&&(t.smart_degen_count||0)>=2;
       if (mc>=MC_MIN&&mc<=MC_MAX&&(t.smart_degen_count||0)>=1&&(t.renowned_count||0)>=1&&(isNew||isReentry)&&!blacklist.has(t.creator||""))
-        results.push({...t, alertType:isReentry?"REENTRY":"KOL", tokenAge});
+        results.push({...t,alertType:isReentry?"REENTRY":"KOL",tokenAge});
     }
   }
   return results.sort((a,b)=>(b.smart_degen_count||0)-(a.smart_degen_count||0));
 }
 
-async function getPumpSignals() {
-  const responses = await fetchGMGNSequential([
-    `/v1/market/trenches?chain=sol&type=near_completion&orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`,
-  ]);
-  const seen=new Set(), results=[];
-  for (const data of responses) {
-    for (const t of getList(data)) {
-      if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
-      seen.add(t.address);
-      const progress=t.launchpad_status?.bonding_curve_percentage||t.progress||0;
-      if (progress>=PUMP_MIN_PROGRESS&&progress<=PUMP_MAX_PROGRESS&&(t.volume||0)>=PUMP_MIN_VOLUME&&(t.holder_count||t.holders||0)>=PUMP_MIN_HOLDERS&&(t.rug_ratio||0)<0.3&&!t.is_wash_trading)
-        results.push({...t, alertType:"PUMP", progress});
-    }
+// ─── TRENCHES — uses /v1/trenches (single call returns all 3 types) ───────────
+async function getTrenchesSignals() {
+  const data=await fetchGMGN("/v1/trenches",{chain:"sol",limit:"100"});
+  if (!data) return { pump:[], ultra:[] };
+
+  const pumpList   = data?.data?.pump         || [];
+  const newList    = data?.data?.new_creation  || [];
+  const pump=[], ultra=[];
+
+  // PumpFun pre-bond (pump phase = near completion)
+  for (const t of pumpList) {
+    if (!t.address||globalAlerted.has(t.address)) continue;
+    const progress=t.launchpad_status?.bonding_curve_percentage||t.progress||0;
+    if (progress>=PUMP_MIN_PROGRESS&&progress<=PUMP_MAX_PROGRESS&&(t.volume||0)>=PUMP_MIN_VOLUME&&(t.holder_count||t.holders||0)>=PUMP_MIN_HOLDERS&&(t.rug_ratio||0)<0.3&&!t.is_wash_trading)
+      pump.push({...t,alertType:"PUMP",progress});
   }
-  return results.sort((a,b)=>(b.volume||0)-(a.volume||0)).slice(0,10);
+
+  // Ultra early (new_creation)
+  for (const t of newList) {
+    if (!t.address||globalAlerted.has(t.address)) continue;
+    const ageMs=t.open_timestamp?Date.now()-t.open_timestamp*1000:null;
+    if (!ageMs||ageMs>ULTRA_MAX_AGE_MS) continue;
+    const progress=t.launchpad_status?.bonding_curve_percentage||t.progress||0;
+    const buys=t.buy_5m||t.swaps_5m||0, sells=t.sell_5m||0;
+    const buyRatio=sells>0?buys/sells:buys;
+    if (progress>=3&&progress<=60&&(t.volume||t.volume_5m||0)>=ULTRA_MIN_VOLUME&&(t.holder_count||t.holders||0)>=ULTRA_MIN_HOLDERS&&buyRatio>=ULTRA_MIN_BUY_RATIO&&(t.rug_ratio||0)<0.2&&!t.is_wash_trading)
+      ultra.push({...t,alertType:"ULTRA_EARLY",ageMs,progress,buys,sells,buyRatio});
+  }
+
+  return {
+    pump: pump.sort((a,b)=>(b.volume||0)-(a.volume||0)).slice(0,10),
+    ultra: ultra.sort((a,b)=>b.buyRatio-a.buyRatio).slice(0,5),
+  };
 }
 
-async function getUltraSignals() {
-  const responses = await fetchGMGNSequential([
-    `/v1/market/trenches?chain=sol&type=new_creation&orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
-  ]);
-  const seen=new Set(), results=[];
-  for (const data of responses) {
-    for (const t of getList(data)) {
-      if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
-      seen.add(t.address);
-      const ageMs=t.open_timestamp?Date.now()-t.open_timestamp*1000:null;
-      if (!ageMs||ageMs>ULTRA_MAX_AGE_MS) continue;
-      const progress=t.launchpad_status?.bonding_curve_percentage||t.progress||0;
-      const buys=t.buy_5m||t.swaps_5m||0, sells=t.sell_5m||0;
-      const buyRatio=sells>0?buys/sells:buys;
-      if (progress>=3&&progress<=60&&(t.volume||t.volume_5m||0)>=ULTRA_MIN_VOLUME&&(t.holder_count||t.holders||0)>=ULTRA_MIN_HOLDERS&&buyRatio>=ULTRA_MIN_BUY_RATIO&&(t.rug_ratio||0)<0.2&&!t.is_wash_trading)
-        results.push({...t, alertType:"ULTRA_EARLY", ageMs, progress, buys, sells, buyRatio});
-    }
-  }
-  return results.sort((a,b)=>b.buyRatio-a.buyRatio).slice(0,5);
-}
-
-function buildKeyboard(mint, isPump) {
-  return { inline_keyboard: [
-    [{ text:"BUY 0.1 SOL via Trojan", url:`https://t.me/solana_trojanbot?start=ca_${mint}` }],
-    [{ text:"DexScreener", url:`https://dexscreener.com/solana/${mint}` }, { text:"GMGN", url:`https://gmgn.ai/sol/token/${mint}` }],
-    [{ text:isPump?"PumpFun":"Axiom", url:isPump?`https://pump.fun/${mint}`:`https://axiom.trade/t/${mint}` }, { text:"Stats", callback_data:"stats" }],
-    [{ text:"Skip", callback_data:`skip_${mint.slice(0,20)}` }],
+function buildKeyboard(mint,isPump) {
+  return {inline_keyboard:[
+    [{text:"BUY 0.1 SOL via Trojan",url:`https://t.me/solana_trojanbot?start=ca_${mint}`}],
+    [{text:"DexScreener",url:`https://dexscreener.com/solana/${mint}`},{text:"GMGN",url:`https://gmgn.ai/sol/token/${mint}`}],
+    [{text:isPump?"PumpFun":"Axiom",url:isPump?`https://pump.fun/${mint}`:`https://axiom.trade/t/${mint}`},{text:"Stats",callback_data:"stats"}],
+    [{text:"Skip",callback_data:`skip_${mint.slice(0,20)}`}],
   ]};
 }
 
-async function sendKOLAlert(token, ai) {
-  const mint=token.address, sym=token.symbol||"???";
+async function sendKOLAlert(token,ai) {
+  const mint=token.address,sym=token.symbol||"???";
   const score=calcFinalScore(token,ai.confidence,Object.keys(insiderBuys[mint]||{}).length);
   const insiders=Object.keys(insiderBuys[mint]||{});
-  const msg =
-    `*${token.alertType==="REENTRY"?"RE-ENTRY":"KOL"} SIGNAL* — ${signalLabel(score)}\n` +
-    `Score:${score} | ${ai.risk} ${ai.confidence}%\n\n*$${sym}*\n\`${mint}\`\n` +
-    `Age:${fmtAge(token.open_timestamp?token.open_timestamp*1000:null)} | Holders:${token.holder_count||"N/A"}\n` +
-    `Price:${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC:${fmt(token.market_cap||0)}\n` +
-    `Vol:${fmt(token.volume||0)} | Liq:${fmt(token.liquidity||0)}\n` +
-    `Smart:${token.smart_degen_count||0} | KOL:${token.renowned_count||0} | Rug:${((token.rug_ratio||0)*100).toFixed(0)}%\n` +
+  const msg=
+    `*${token.alertType==="REENTRY"?"RE-ENTRY":"KOL"} SIGNAL* — ${signalLabel(score)}\n`+
+    `Score:${score} | ${ai.risk} ${ai.confidence}%\n\n*$${sym}*\n\`${mint}\`\n`+
+    `Age:${fmtAge(token.open_timestamp?token.open_timestamp*1000:null)} | Holders:${token.holder_count||"N/A"}\n`+
+    `Price:${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC:${fmt(token.market_cap||0)}\n`+
+    `Vol:${fmt(token.volume||0)} | Liq:${fmt(token.liquidity||0)}\n`+
+    `Smart:${token.smart_degen_count||0} | KOL:${token.renowned_count||0} | Rug:${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
     (insiders.length?`Insiders: ${insiders.join(", ")}\n`:"")+`\nSnipe 0.1 SOL?`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,false)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol");
@@ -446,15 +355,15 @@ async function sendKOLAlert(token, ai) {
   log(`KOL: $${sym} score:${score}`);
 }
 
-async function sendPumpAlert(token, ai) {
-  const mint=token.address, sym=token.symbol||"???";
+async function sendPumpAlert(token,ai) {
+  const mint=token.address,sym=token.symbol||"???";
   const progress=token.progress||0;
   const bar="X".repeat(Math.floor(progress/10))+".".repeat(10-Math.floor(progress/10));
-  const msg =
-    `*PUMPFUN PRE-BOND* — ${progress>=90?"MIGRATING SOON":progress>=75?"FILLING FAST":"EARLY"}\n` +
-    `${ai.risk} ${ai.confidence}%\n\n*$${sym}*\n\`${mint}\`\n` +
-    `[${bar}] ${progress.toFixed(1)}%\n` +
-    `Price:${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC:${fmt(token.market_cap||0)} | Vol:${fmt(token.volume||0)}\n` +
+  const msg=
+    `*PUMPFUN PRE-BOND* — ${progress>=90?"MIGRATING SOON":progress>=75?"FILLING FAST":"EARLY"}\n`+
+    `${ai.risk} ${ai.confidence}%\n\n*$${sym}*\n\`${mint}\`\n`+
+    `[${bar}] ${progress.toFixed(1)}%\n`+
+    `Price:${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC:${fmt(token.market_cap||0)} | Vol:${fmt(token.volume||0)}\n`+
     `Smart:${token.smart_degen_count||0} | KOL:${token.renowned_count||0}\nBuy before Raydium migration!`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump");
@@ -462,17 +371,17 @@ async function sendPumpAlert(token, ai) {
   log(`Pump: $${sym} ${progress.toFixed(0)}%`);
 }
 
-async function sendUltraAlert(token, ai) {
-  const mint=token.address, sym=token.symbol||"???";
+async function sendUltraAlert(token,ai) {
+  const mint=token.address,sym=token.symbol||"???";
   const ageMin=Math.floor((token.ageMs||0)/60000);
   const progress=token.progress||0;
   const bar="X".repeat(Math.floor(progress/10))+".".repeat(10-Math.floor(progress/10));
-  const msg =
-    `*ULTRA EARLY* — ${token.buyRatio>=10?"INSANE":token.buyRatio>=5?"VERY HIGH":"HIGH"}\n` +
-    `${ai.risk} ${ai.confidence}%\n\n*$${sym}*\n\`${mint}\`\n` +
-    `Age:${ageMin}m | Holders:${token.holder_count||"N/A"}\n` +
-    `[${bar}] ${progress.toFixed(1)}%\n` +
-    `Vol:${fmt(token.volume||token.volume_5m||0)} | B/S:${token.buyRatio?token.buyRatio.toFixed(1):"N/A"}:1\n` +
+  const msg=
+    `*ULTRA EARLY* — ${token.buyRatio>=10?"INSANE":token.buyRatio>=5?"VERY HIGH":"HIGH"}\n`+
+    `${ai.risk} ${ai.confidence}%\n\n*$${sym}*\n\`${mint}\`\n`+
+    `Age:${ageMin}m | Holders:${token.holder_count||"N/A"}\n`+
+    `[${bar}] ${progress.toFixed(1)}%\n`+
+    `Vol:${fmt(token.volume||token.volume_5m||0)} | B/S:${token.buyRatio?token.buyRatio.toFixed(1):"N/A"}:1\n`+
     `Price:${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC:${fmt(token.market_cap||0)}\nAlways DYOR`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra");
@@ -483,9 +392,9 @@ async function sendUltraAlert(token, ai) {
 async function scan() {
   log("Scanning...");
   pollInsiderWallets().catch(()=>{});
-  const kolTokens   = await getKOLSignals();
-  const pumpTokens  = await getPumpSignals();
-  const ultraTokens = await getUltraSignals();
+
+  const kolTokens=await getKOLSignals();
+  const {pump:pumpTokens,ultra:ultraTokens}=await getTrenchesSignals();
   log(`KOL:${kolTokens.length} Pump:${pumpTokens.length} Ultra:${ultraTokens.length}`);
 
   const allTokens=[
@@ -506,13 +415,13 @@ async function scan() {
     const mint=token.address;
     if (globalAlerted.has(mint)) continue;
     if (alerted.has(mint)&&Date.now()-alerted.get(mint)<ALERT_COOLDOWN_MS) continue;
-    globalAlerted.add(mint); alerted.set(mint,Date.now());
+    globalAlerted.add(mint);alerted.set(mint,Date.now());
     try {
       if (token._type==="ultra") await sendUltraAlert(token,token._ai);
       else if (token._type==="pump") await sendPumpAlert(token,token._ai);
       else await sendKOLAlert(token,token._ai);
       sent++;
-    } catch(e) { log(`Alert error: ${e.message}`); }
+    } catch(e){log(`Alert error: ${e.message}`);}
     await new Promise(r=>setTimeout(r,3000));
   }
 
@@ -523,18 +432,17 @@ async function scan() {
 }
 
 async function main() {
-  log("KOL Tracker v15 — Fixed filters[] signing");
+  log("KOL Tracker v16 — Correct endpoints + Standard Auth only");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
-  log(`API Key: ${GMGN_API_KEY?"SET":"MISSING"}`);
-  log(`Private Key: ${GMGN_PRIVATE_KEY?"SET len:"+GMGN_PRIVATE_KEY.length:"MISSING"}`);
+  log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `*KOL Tracker v15 Online*\nSigning: ${GMGN_PRIVATE_KEY?"YES":"NO"} | Key: ${GMGN_API_KEY?"SET":"MISSING"}\nScan: 60s`,
-    { parse_mode:"Markdown" }
+    `*KOL Tracker v16 Online*\nEndpoints: /v1/market/rank + /v1/trenches\nAuth: Standard only (no signing)\nScan: 60s`,
+    {parse_mode:"Markdown"}
   );
 
   await scan();
-  setInterval(scan, POLL_INTERVAL_MS);
+  setInterval(scan,POLL_INTERVAL_MS);
 }
 
-main().catch(e=>{ log(`Fatal: ${e.message}`); process.exit(1); });
+main().catch(e=>{log(`Fatal: ${e.message}`);process.exit(1);});
