@@ -440,15 +440,16 @@ async function fetchGMGNSequential(paths) {
 // ─── KOL SIGNALS ─────────────────────────────────────────────────────────────
 async function getKOLSignals() {
   const paths = [
-    `/defi/quotation/v1/rank/sol/swaps/1h?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
-    `/defi/quotation/v1/rank/sol/swaps/1h?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
+    `/v1/tokens/sol/trending?interval=1h&orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
+    `/v1/tokens/sol/trending?interval=1h&orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
   ];
   const responses = await fetchGMGNSequential(paths);
   const seen = new Set(); const results = [];
   for (const data of responses) {
     if (!data) continue;
-    const tokens = data?.data?.rank || [];
-    for (const t of tokens) {
+    const tokens = data?.data?.rank || data?.data?.tokens || data?.data || [];
+    const list = Array.isArray(tokens) ? tokens : [];
+    for (const t of list) {
       if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
       seen.add(t.address);
       const mc       = t.market_cap || 0;
@@ -473,15 +474,16 @@ async function getKOLSignals() {
 // ─── PUMPFUN PRE-BOND ─────────────────────────────────────────────────────────
 async function getPumpSignals() {
   const paths = [
-    `/defi/quotation/v1/rank/sol/pump?orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`,
-    `/defi/quotation/v1/rank/sol/pump?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&limit=100`,
+    `/v1/trenches/sol?type=near_completion&orderby=volume&direction=desc&filters[]=not_honeypot&limit=100`,
+    `/v1/trenches/sol?type=near_completion&orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&limit=100`,
   ];
   const responses = await fetchGMGNSequential(paths);
   const seen = new Set(); const results = [];
   for (const data of responses) {
     if (!data) continue;
-    const tokens = data?.data?.rank || [];
-    for (const t of tokens) {
+    const tokens = data?.data?.rank || data?.data?.tokens || data?.data || [];
+    const list = Array.isArray(tokens) ? tokens : [];
+    for (const t of list) {
       if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
       seen.add(t.address);
       const progress = t.launchpad_status?.bonding_curve_percentage || t.progress || 0;
@@ -506,15 +508,15 @@ async function getPumpSignals() {
 // ─── ULTRA EARLY ─────────────────────────────────────────────────────────────
 async function getUltraSignals() {
   const paths = [
-    `/defi/quotation/v1/rank/sol/pump?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
-    `/defi/quotation/v1/rank/sol/swaps/5m?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
+    `/v1/trenches/sol?type=new_creation&orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`,
   ];
   const responses = await fetchGMGNSequential(paths);
   const seen = new Set(); const results = [];
   for (const data of responses) {
     if (!data) continue;
-    const tokens = data?.data?.rank || [];
-    for (const t of tokens) {
+    const tokens = data?.data?.rank || data?.data?.tokens || data?.data || [];
+    const list = Array.isArray(tokens) ? tokens : [];
+    for (const t of list) {
       if (!t.address || seen.has(t.address) || globalAlerted.has(t.address)) continue;
       seen.add(t.address);
       const ageMs    = t.open_timestamp ? Date.now() - t.open_timestamp * 1000 : null;
