@@ -350,6 +350,7 @@ async function getKOLSignals() {
 }
 
 function processKOLList(list, seen, results) {
+  if (list.length > 0) log(`KOL sample fields: ${JSON.stringify(Object.keys(list[0])).slice(0,200)}`);
   for (const t of list) {
     if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
     seen.add(t.address);
@@ -569,7 +570,9 @@ async function scan() {
     ...kolTokens.map(t=>({...t,_type:"kol"})),
     ...pumpTokens.map(t=>({...t,_type:"pump"})),
   ];
-  const filtered=allTokens.filter(t=>t._type==="ultra"||t._type==="pump"||hardFilter(t));
+  // TEST MODE: bypass hardFilter to diagnose missing fields
+  const filtered=allTokens.filter(t=>t.address);
+  log(`Tokens after filter: ${filtered.length}`);
   const aiResults=await Promise.all(filtered.map(t=>claudeFilter(t)));
   const scored=filtered
     .map((t,i)=>({...t,_ai:aiResults[i],_score:calcFinalScore(t,aiResults[i].confidence,Object.keys(insiderBuys[t.address]||{}).length)}))
@@ -600,11 +603,11 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker GOD MODE — Dual Source (Public + OpenAPI fallback)");
+  log("KOL Tracker TEST — No hardFilter + field debug");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
 
   await bot.sendMessage(CHAT_ID,
-    `🚀 *KOL Tracker GOD MODE Online*\n\n`+
+    `🧪 *KOL Tracker TEST MODE Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🤖 Claude AI filter active\n`+
