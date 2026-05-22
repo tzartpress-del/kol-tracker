@@ -3,17 +3,19 @@ const axios = require("axios");
 const https = require("https");
 const dns   = require("dns");
 const { v4: uuidv4 } = require("uuid");
+const crypto = require("crypto");
 
 process.on("unhandledRejection", console.error);
 process.on("uncaughtException", console.error);
 dns.setDefaultResultOrder("ipv4first");
 
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const CHAT_ID        = process.env.CHAT_ID;
-const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
-const GMGN_API_KEY   = process.env.GMGN_API_KEY;
+const TELEGRAM_TOKEN    = process.env.TELEGRAM_TOKEN;
+const CHAT_ID           = process.env.CHAT_ID;
+const HELIUS_API_KEY    = process.env.HELIUS_API_KEY;
+const CLAUDE_API_KEY    = process.env.CLAUDE_API_KEY;
+const GMGN_API_KEY      = process.env.GMGN_API_KEY;
+const GMGN_PRIVATE_KEY  = process.env.GMGN_PRIVATE_KEY;
 
 // ─── SETTINGS ─────────────────────────────────────────────────────────────────
 const MC_MIN              = 15000;
@@ -83,6 +85,66 @@ function velocityLabel(v) {
   if (v >= 1.0) return "✅ STABLE";
   if (v <  0.5) return "💀 DYING";
   return "🟡 MODERATE";
+}
+
+// ─── GMGN REQUEST SIGNING ─────────────────────────────────────────────────────
+// GMGN uses Ed25519 or RSA-SHA256 signing
+// Message format: "{sub_path}:{sorted_query_string}:{request_body}:{timestamp}"
+function buildSignature(subPath, queryParams, timestamp) {
+  if (!GMGN_PRIVATE_KEY) return null;
+  try {
+    // Sort query params alphabetically
+    const sortedParams = Object.keys(queryParams)
+      .sort()
+      .map(k => `${k}=${queryParams[k]}`)
+      .join("&");
+
+    const message = `${subPath}:${sortedParams}::${timestamp}`;
+
+    // Try Ed25519 first, fall back to RSA
+    let privateKeyStr = GMGN_PRIVATE_KEY.trim();
+
+    // Handle raw base64 Ed25519 key (no PEM headers)
+    if (!privateKeyStr.includes("-----")) {
+      // Raw base64 Ed25519 private key
+      try {
+        const keyBuffer = Buffer.from(privateKeyStr, "base64");
+        const privateKey = crypto.createPrivateKey({
+          key: keyBuffer,
+          format: "der",
+          type: "pkcs8",
+        });
+        const signature = crypto.sign(null, Buffer.from(message), privateKey);
+        return signature.toString("base64");
+      } catch (e) {
+        log(`Ed25519 raw sign failed: ${e.message}`);
+      }
+    }
+
+    // PEM format — try Ed25519 then RSA
+    try {
+      const signature = crypto.sign(null, Buffer.from(message), {
+        key: privateKeyStr,
+        format: "pem",
+      });
+      return signature.toString("base64");
+    } catch (e) {
+      // Try RSA-SHA256
+      try {
+        const signature = crypto.sign("sha256", Buffer.from(message), {
+          key: privateKeyStr,
+          padding: crypto.constants.RSA_PKCS1_PSS_PADDING,
+        });
+        return signature.toString("base64");
+      } catch (e2) {
+        log(`RSA sign failed: ${e2.message}`);
+        return null;
+      }
+    }
+  } catch (e) {
+    log(`Signing error: ${e.message}`);
+    return null;
+  }
 }
 
 // ─── HARD FILTER ─────────────────────────────────────────────────────────────
@@ -178,9 +240,9 @@ async function claudeFilter(token) {
   const smart = token.smart_degen_count || 0;
   const liq   = token.liquidity || 0;
 
-  if (rug > 0.5)             return { decision: "REJECT", reason: "Rug >50%",      risk: "VERY HIGH", confidence: 99 };
-  if (liq < 3000)            return { decision: "REJECT", reason: "Liq too low",   risk: "VERY HIGH", confidence: 99 };
-  if (token.is_wash_trading) return { decision: "REJECT", reason: "Wash trading",  risk: "VERY HIGH", confidence: 99 };
+  if (rug > 0.5)             return { decision: "REJECT", reason: "Rug >50%",     risk: "VERY HIGH", confidence: 99 };
+  if (liq < 3000)            return { decision: "REJECT", reason: "Liq too low",  risk: "VERY HIGH", confidence: 99 };
+  if (token.is_wash_trading) return { decision: "REJECT", reason: "Wash trading", risk: "VERY HIGH", confidence: 99 };
 
   if (smart >= 3 && rug < 0.1) {
     const result = { decision: "APPROVE", reason: "Strong smart money", risk: "LOW", confidence: 92 };
@@ -397,15 +459,40 @@ async function fetchGMGN(path) {
   try {
     const timestamp = Math.floor(Date.now() / 1000);
     const client_id = uuidv4();
-    const separator = path.includes("?") ? "&" : "?";
-    const url = `https://openapi.gmgn.ai${path}${separator}timestamp=${timestamp}&client_id=${client_id}`;
 
-    const res = await axiosGMGN.get(url, {
-      headers: {
-        "X-APIKEY": GMGN_API_KEY,
-        "Content-Type": "application/json",
-      },
-    });
+    // Parse existing query params from path
+    const [subPath, existingQuery] = path.split("?");
+    const queryObj = {};
+    if (existingQuery) {
+      existingQuery.split("&").forEach(pair => {
+        const [k, v] = pair.split("=");
+        if (k) queryObj[decodeURIComponent(k)] = decodeURIComponent(v || "");
+      });
+    }
+    queryObj["timestamp"] = String(timestamp);
+    queryObj["client_id"] = client_id;
+
+    // Build signature
+    const signature = buildSignature(subPath, queryObj, timestamp);
+
+    // Build final URL with all params
+    const queryString = Object.keys(queryObj)
+      .sort()
+      .map(k => `${encodeURIComponent(k)}=${encodeURIComponent(queryObj[k])}`)
+      .join("&");
+
+    const url = `https://openapi.gmgn.ai${subPath}?${queryString}`;
+
+    const headers = {
+      "X-APIKEY":    GMGN_API_KEY,
+      "Content-Type": "application/json",
+    };
+    if (signature) {
+      headers["X-Signature"] = signature;
+      log(`Signing request: ${subPath} sig=${signature.slice(0, 20)}...`);
+    }
+
+    const res = await axiosGMGN.get(url, { headers });
 
     if (res.status === 429) {
       log("GMGN 429 — rate limited, backing off 60s");
@@ -413,32 +500,33 @@ async function fetchGMGN(path) {
       return null;
     }
     if (res.status === 403) {
-      log("GMGN 403 — Cloudflare block, backing off 5 mins");
+      log("GMGN 403 — blocked, backing off 5 mins");
       gmgnBlocked = true; gmgnBlockUntil = Date.now() + 300000;
-      return null;
-    }
-    if (res.status === 404) {
-      log(`GMGN 404 — endpoint not found: ${path.slice(0, 50)}`);
       return null;
     }
     if (res.status === 401) {
       log(`GMGN 401 — Auth failed: ${JSON.stringify(res.data)}`);
       return null;
     }
+    if (res.status === 404) {
+      log(`GMGN 404 — not found: ${path.slice(0, 60)}`);
+      return null;
+    }
     if (res.status !== 200) {
-      log(`GMGN ${res.status}: ${path.slice(0, 40)}`);
+      log(`GMGN ${res.status}: ${JSON.stringify(res.data)?.slice(0, 100)}`);
       return null;
     }
     if (typeof res.data === "string") {
-      log("GMGN returned HTML — likely Cloudflare page");
+      log("GMGN returned HTML — Cloudflare block");
       gmgnBlocked = true; gmgnBlockUntil = Date.now() + 120000;
       return null;
     }
-    // New OpenAPI wraps response: { code: 0, data: { ... } }
     if (res.data?.code !== undefined && res.data.code !== 0) {
       log(`GMGN API error: ${res.data.error} — ${res.data.message}`);
       return null;
     }
+
+    log(`GMGN OK: ${subPath}`);
     return res.data;
   } catch (e) {
     log(`GMGN error: ${e.message}`);
@@ -801,11 +889,11 @@ async function scan() {
   }
 }
 
-// ─── PRINT RAILWAY IP ON STARTUP ─────────────────────────────────────────────
+// ─── PRINT RAILWAY IP ────────────────────────────────────────────────────────
 async function printOutboundIP() {
   try {
     const res = await axios.get("https://api.ipify.org?format=json", { timeout: 5000 });
-    log(`🌐 Railway outbound IP: ${res.data.ip} — whitelist this in GMGN dashboard`);
+    log(`🌐 Railway outbound IP: ${res.data.ip}`);
   } catch (e) {
     log("Could not fetch outbound IP");
   }
@@ -813,29 +901,20 @@ async function printOutboundIP() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker v13 Final — Elite Signal Engine");
+  log("KOL Tracker v14 Final — With Request Signing");
   await printOutboundIP();
+  log(`GMGN_API_KEY set: ${!!GMGN_API_KEY}`);
+  log(`GMGN_PRIVATE_KEY set: ${!!GMGN_PRIVATE_KEY}`);
+  log(`Private key length: ${GMGN_PRIVATE_KEY ? GMGN_PRIVATE_KEY.length : 0}`);
 
   await bot.sendMessage(CHAT_ID,
-    `🟢 *KOL Tracker v13 Final Online*\n\n` +
-    `🏆 Elite Signal Engine\n\n` +
+    `🟢 *KOL Tracker v14 Final Online*\n\n` +
+    `🔐 Request signing: ${GMGN_PRIVATE_KEY ? "✅ Enabled" : "❌ Missing key"}\n` +
+    `🔑 API Key: ${GMGN_API_KEY ? "✅ Set" : "❌ Missing"}\n\n` +
     `📡 *3 Signal Types:*\n` +
-    `├ 🚨 KOL Signal — smart money + KOL overlap\n` +
-    `├ ♻️ Re-Entry — vol spike on known tokens\n` +
-    `├ 🎯 PumpFun Pre-Bond — 60-98% curve\n` +
-    `└ 🚀 Ultra Early — under 30 mins\n\n` +
-    `🔒 *Filters:*\n` +
-    `├ MC: $15K–$150K\n` +
-    `├ Hard filter before Claude\n` +
-    `├ Claude Haiku (max 50/day)\n` +
-    `├ Strong signals auto-approved\n` +
-    `└ TOP 3 per scan\n\n` +
-    `📊 *Tracking:*\n` +
-    `├ 2x/5x/10x milestones\n` +
-    `├ Distribution warnings\n` +
-    `├ Liquidity warnings\n` +
-    `└ 24hr final report\n\n` +
-    `✅ GMGN OpenAPI v1 connected\n` +
+    `├ 🚨 KOL Signal\n` +
+    `├ 🎯 PumpFun Pre-Bond\n` +
+    `└ 🚀 Ultra Early\n\n` +
     `Scan every 60s 🚀`,
     { parse_mode: "Markdown" }
   );
