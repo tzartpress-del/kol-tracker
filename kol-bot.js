@@ -14,20 +14,20 @@ const HELIUS_API_KEY   = process.env.HELIUS_API_KEY;
 const CLAUDE_API_KEY   = process.env.CLAUDE_API_KEY;
 const GMGN_API_KEY     = process.env.GMGN_API_KEY;
 
-const MC_MIN              = 15000;
-const MC_MAX              = 150000;
+const MC_MIN              = 10000;
+const MC_MAX              = 300000;
 const POLL_INTERVAL_MS    = 60000;
 const ALERT_COOLDOWN_MS   = 3600000;
 const MAX_TOKEN_AGE_MS    = 24 * 60 * 60 * 1000;
-const REENTRY_MIN_VOLUME  = 50000;
-const PUMP_MIN_VOLUME     = 20000;
-const PUMP_MIN_PROGRESS   = 60;
+const REENTRY_MIN_VOLUME  = 25000;
+const PUMP_MIN_VOLUME     = 10000;
+const PUMP_MIN_PROGRESS   = 40;
 const PUMP_MAX_PROGRESS   = 98;
-const PUMP_MIN_HOLDERS    = 100;
+const PUMP_MIN_HOLDERS    = 50;
 const ULTRA_MAX_AGE_MS    = 30 * 60 * 1000;
-const ULTRA_MIN_VOLUME    = 3000;
-const ULTRA_MIN_HOLDERS   = 30;
-const ULTRA_MIN_BUY_RATIO = 2;
+const ULTRA_MIN_VOLUME    = 1000;
+const ULTRA_MIN_HOLDERS   = 15;
+const ULTRA_MIN_BUY_RATIO = 1.5;
 const CLAUDE_DAILY_LIMIT  = 50;
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, {
@@ -462,12 +462,12 @@ async function scan() {
 }
 
 async function main() {
-  log("KOL Tracker v17 — /v1/market/rank + /v1/trenches fixed 405");
+  log("KOL Tracker GOD MODE — Optimized Filters");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `*KOL Tracker v17 Online*\n\nEndpoints:\n/v1/market/rank ✅\n/v1/trenches (405 fix)\n\nScan: 60s`,
+    `*KOL Tracker GOD MODE Online*\n\nEndpoints:\n/v1/market/rank ✅\n/v1/trenches (405 fix)\n\nScan: 60s`,
     {parse_mode:"Markdown"}
   );
 
