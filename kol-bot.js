@@ -287,6 +287,33 @@ async function fetchPublic(url) {
 const ipv4Agent=new https.Agent({family:4,keepAlive:true});
 const axiosAPI=axios.create({httpsAgent:ipv4Agent,timeout:20000,validateStatus:()=>true});
 
+// SOL launchpad platforms from official GMGN client code
+const SOL_LAUNCHPAD_PLATFORMS = [
+  "Pump.fun","pump_mayhem","pump_mayhem_agent","pump_agent",
+  "letsbonk","bonkers","bags","memoo","liquid","bankr","zora",
+  "surge","anoncoin","moonshot_app","wendotdev","heaven","sugar",
+  "token_mill","believe","trendsfun","trends_fun","jup_studio",
+  "Moonshot","boop","ray_launchpad","meteora_virtual_curve","xstocks",
+];
+// SOL quote address types from official GMGN client code
+const SOL_QUOTE_ADDRESS_TYPES = [4,5,3,1,13,0];
+
+// Build correct trenches POST body per official GMGN client
+function buildTrenchesBody(types, limit=80) {
+  const section = {
+    filters: ["offchain","onchain"],
+    launchpad_platform: SOL_LAUNCHPAD_PLATFORMS,
+    quote_address_type: SOL_QUOTE_ADDRESS_TYPES,
+    launchpad_platform_v2: true,
+    limit,
+  };
+  const body = { version: "v2" };
+  for (const type of types) {
+    body[type] = { ...section };
+  }
+  return body;
+}
+
 async function fetchOpenAPI(subPath, params={}, method="GET") {
   const wait=2000-(Date.now()-lastOpenAPICall);
   if (wait>0) await new Promise(r=>setTimeout(r,wait));
@@ -294,35 +321,30 @@ async function fetchOpenAPI(subPath, params={}, method="GET") {
   try {
     const ts=Math.floor(Date.now()/1000);
     const cid=uuidv4();
-    // For GET: params go in query string
-    // For POST: auth params go in query string, data params go in body
-    const authParams={timestamp:String(ts),client_id:cid};
-    const qs=Object.entries(authParams).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
-    const url=`https://openapi.gmgn.ai${subPath}?${qs}`;
     const headers={"X-APIKEY":GMGN_API_KEY,"Accept":"application/json","Content-Type":"application/json"};
 
     let res;
     if (method==="POST") {
-      // For POST: chain goes in BOTH query string and body
-      // Auth params (timestamp, client_id) in query string
-      // Data params in JSON body
-      // chain must also be in query string per API requirements
+      // For POST: chain + auth params in query string, body is the POST body
+      // chain does NOT go in the body per official client code
       const chain = params.chain || "sol";
-      const postQs = `${qs}&chain=${chain}`;
-      const postUrl = `https://openapi.gmgn.ai${subPath}?${postQs}`;
-      log(`POST ${postUrl.slice(0,100)} body:${JSON.stringify(params)}`);
-      res=await axiosAPI.post(postUrl, params, {headers});
+      const qs = `chain=${chain}&timestamp=${ts}&client_id=${cid}`;
+      const url = `https://openapi.gmgn.ai${subPath}?${qs}`;
+      log(`POST ${url.slice(0,120)}`);
+      log(`Body: ${JSON.stringify(params.body||params).slice(0,150)}`);
+      const body = params.body || params;
+      res=await axiosAPI.post(url, body, {headers});
     } else {
-      // Send params as query string for GET
-      const allParams={...params,...authParams};
-      const fullQs=Object.entries(allParams).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
-      const getUrl=`https://openapi.gmgn.ai${subPath}?${fullQs}`;
-      res=await axiosAPI.get(getUrl,{headers});
+      // GET: all params in query string
+      const allParams={...params, timestamp:String(ts), client_id:cid};
+      const qs=Object.entries(allParams).map(([k,v])=>`${k}=${encodeURIComponent(v)}`).join("&");
+      const url=`https://openapi.gmgn.ai${subPath}?${qs}`;
+      res=await axiosAPI.get(url,{headers});
     }
 
     if (res.status===405&&method==="GET") return fetchOpenAPI(subPath,params,"POST");
     if (res.status!==200||typeof res.data==="string") {
-      log(`OpenAPI ${res.status}: ${JSON.stringify(res.data)?.slice(0,100)}`);
+      log(`OpenAPI ${res.status}: ${JSON.stringify(res.data)?.slice(0,150)}`);
       return null;
     }
     if (res.data?.code!==0) { log(`OpenAPI err: ${res.data?.error} ${res.data?.message}`); return null; }
@@ -412,11 +434,12 @@ async function getPumpSignals() {
   // Fall back to OpenAPI — POST with correct body
   if (!publicWorked) {
     log("Public Pump API failed — using OpenAPI fallback");
-    const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",limit:80},"POST");
+    const trenchBody=buildTrenchesBody(["near_completion"]);
+    const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",body:trenchBody},"POST");
     if (data) {
-      log(`Trenches ALL keys: ${JSON.stringify(Object.keys(data?.data||{}))}`);
-      const pumpList=data?.data?.pump||data?.data?.near_completion||data?.data?.completing||[];
-      log(`Trenches pump list length: ${pumpList.length}`);
+      log(`Trenches keys: ${JSON.stringify(Object.keys(data?.data||{}))}`);
+      const pumpList=data?.data?.pump||[];
+      log(`Pump list length: ${pumpList.length}`);
       processPumpList(pumpList,seen,results);
     }
   }
@@ -462,11 +485,12 @@ async function getUltraSignals() {
   // Fall back to OpenAPI — POST with correct body
   if (!publicWorked) {
     log("Public Ultra API failed — using OpenAPI fallback");
-    const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",limit:80},"POST");
+    const trenchBody=buildTrenchesBody(["new_creation"]);
+    const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",body:trenchBody},"POST");
     if (data) {
-      log(`Trenches ALL keys (ultra): ${JSON.stringify(Object.keys(data?.data||{}))}`);
-      const newList=data?.data?.new_creation||data?.data?.new||data?.data?.newCreation||[];
-      log(`Trenches new_creation list length: ${newList.length}`);
+      log(`Trenches keys (ultra): ${JSON.stringify(Object.keys(data?.data||{}))}`);
+      const newList=data?.data?.new_creation||[];
+      log(`New creation list length: ${newList.length}`);
       processUltraList(newList,seen,results);
     }
   }
@@ -643,11 +667,11 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker TEST v5 — No type filter, log all trenches keys");
+  log("KOL Tracker TEST v6 — Correct trenches POST body from official client");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
 
   await bot.sendMessage(CHAT_ID,
-    `🧪 *KOL Tracker TEST v5 Online*\n\n`+
+    `🧪 *KOL Tracker TEST v6 Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🤖 Claude AI filter active\n`+
