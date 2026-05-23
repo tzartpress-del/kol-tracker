@@ -448,18 +448,17 @@ async function getPumpSignals() {
 }
 
 function processPumpList(list, seen, results) {
+  // Log first token fields to see actual structure
+  if (list.length > 0) log(`PUMP sample fields: ${JSON.stringify(Object.keys(list[0])).slice(0,300)}`);
+  if (list.length > 0) log(`PUMP sample token: ${JSON.stringify(list[0]).slice(0,400)}`);
   for (const t of list) {
     if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
     seen.add(t.address);
-    // Trenches uses different field names per docs
+    // NO FILTERS — let everything through to test
     const progress=t.launchpad_status?.bonding_curve_percentage||t.graduation_progress||t.progress||0;
-    const volume=t.volume_1h||t.volume_24h||t.volume||0;
-    const holders=t.holder_count||0;
     const mc=t.usd_market_cap||t.market_cap||0;
-    if (progress>=PUMP_MIN_PROGRESS&&progress<=PUMP_MAX_PROGRESS&&
-        volume>=PUMP_MIN_VOLUME&&holders>=PUMP_MIN_HOLDERS&&
-        (t.rug_ratio||0)<0.3&&!t.is_wash_trading)
-      results.push({...t,alertType:"PUMP",progress,market_cap:mc,volume:volume});
+    const volume=t.volume_1h||t.volume_24h||t.volume||0;
+    results.push({...t,alertType:"PUMP",progress,market_cap:mc,volume:volume});
   }
 }
 
@@ -499,25 +498,22 @@ async function getUltraSignals() {
 }
 
 function processUltraList(list, seen, results) {
+  // Log first token fields to see actual structure
+  if (list.length > 0) log(`ULTRA sample fields: ${JSON.stringify(Object.keys(list[0])).slice(0,300)}`);
+  if (list.length > 0) log(`ULTRA sample token: ${JSON.stringify(list[0]).slice(0,400)}`);
   for (const t of list) {
     if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
     seen.add(t.address);
-    // Trenches uses created_timestamp, not open_timestamp
+    // NO FILTERS — let everything through to test
     const ageMs=t.created_timestamp?(Date.now()-t.created_timestamp*1000):
                 t.open_timestamp?(Date.now()-t.open_timestamp*1000):null;
-    if (!ageMs||ageMs>ULTRA_MAX_AGE_MS) continue;
     const progress=t.launchpad_status?.bonding_curve_percentage||t.progress||0;
-    const volume=t.volume_1h||t.volume_24h||t.volume||t.volume_5m||0;
-    const holders=t.holder_count||0;
     const buys=t.buys_24h||t.buy_5m||t.swaps_5m||0;
     const sells=t.sells_24h||t.sell_5m||0;
     const buyRatio=sells>0?buys/sells:buys;
     const mc=t.usd_market_cap||t.market_cap||0;
-    if (progress>=3&&progress<=60&&
-        volume>=ULTRA_MIN_VOLUME&&holders>=ULTRA_MIN_HOLDERS&&
-        buyRatio>=ULTRA_MIN_BUY_RATIO&&
-        (t.rug_ratio||0)<0.2&&!t.is_wash_trading)
-      results.push({...t,alertType:"ULTRA_EARLY",ageMs,progress,buys,sells,buyRatio,market_cap:mc,volume:volume});
+    const volume=t.volume_1h||t.volume_24h||t.volume||0;
+    results.push({...t,alertType:"ULTRA_EARLY",ageMs:ageMs||0,progress,buys,sells,buyRatio,market_cap:mc,volume:volume});
   }
 }
 
@@ -667,11 +663,11 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker TEST v6 — Correct trenches POST body from official client");
+  log("KOL Tracker TEST v7 — No filters on pump/ultra, log fields");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
 
   await bot.sendMessage(CHAT_ID,
-    `🧪 *KOL Tracker TEST v6 Online*\n\n`+
+    `🧪 *KOL Tracker TEST v7 Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🤖 Claude AI filter active\n`+
