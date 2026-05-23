@@ -461,15 +461,20 @@ function processPumpList(list, seen, results) {
     const wash     = t.is_wash_trading || false;
     const buys24h  = t.buys_24h || t.buys || 0;
 
+    const top10p   = t.top_10_holder_rate || 0;
+    const smart_p  = t.smart_degen_count || 0;
+
     if (
       volume   >= PUMP_MIN_VOLUME    &&
       holders  >= PUMP_MIN_HOLDERS   &&
-      rug      < 0.3                 &&
-      bundle   < 0.5                 &&
+      rug      < 0.25                &&
+      bundle   < 0.4                 &&
       !wash                          &&
       buys24h  >= 10                 &&
       mc       >= 5000               &&
-      mc       <= 500000
+      mc       <= 500000             &&
+      top10p   < 0.6                 &&   // not too concentrated
+      (smart_p >= 1 || holders >= 150)    // smart money OR good holder count
     ) {
       results.push({...t, alertType:"PUMP", progress, market_cap:mc, volume});
     }
@@ -529,12 +534,24 @@ function processUltraList(list, seen, results) {
     const rug      = t.rug_ratio || 0;
     const wash     = t.is_wash_trading || false;
 
+    const bundle   = t.bundler_trader_amount_rate || 0;
+    const top10    = t.top_10_holder_rate || 0;
+    const buyTax   = parseFloat(t.buy_tax || 0);
+    const burned   = t.burn_status === "burn";
+    const smart    = t.smart_degen_count || 0;
+    const devBal   = t.creator_balance_rate || 0;
+
     if (
       volume   >= ULTRA_MIN_VOLUME    &&
       holders  >= ULTRA_MIN_HOLDERS   &&
       buyRatio >= ULTRA_MIN_BUY_RATIO &&
-      rug      < 0.2                  &&
-      !wash
+      rug      <  0.15                &&   // stricter rug check
+      !wash                           &&
+      bundle   <  0.3                 &&   // no bundler clusters
+      top10    <  0.5                 &&   // not concentrated
+      buyTax   == 0                   &&   // no honeypot tax
+      devBal   <  0.2                 &&   // dev not holding too much
+      (burned || smart >= 1)               // liq burned OR smart money in
     ) {
       results.push({...t, alertType:"ULTRA_EARLY", ageMs, progress, buys, sells, buyRatio, market_cap:mc, volume});
     }
@@ -687,11 +704,11 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("KOL Tracker TEST v8 — Correct filters using real field names");
+  log("KOL Tracker TEST v9 — Stricter Ultra+Pump security filters");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
 
   await bot.sendMessage(CHAT_ID,
-    `🧪 *KOL Tracker TEST v8 Online*\n\n`+
+    `🧪 *KOL Tracker TEST v9 Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🤖 Claude AI filter active\n`+
