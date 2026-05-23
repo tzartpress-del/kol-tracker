@@ -93,14 +93,14 @@ function signalLabel(s) {
   return "LOW";
 }
 
-// ─── ORIGINAL V12 HARD FILTER (KOL only) ─────────────────────────────────────
+// ─── HARD FILTER — restored original v12 (enriched tokens have all fields) ────
 function hardFilter(token) {
-  const holders = token.holder_count || 0;
-  const liq     = token.liquidity    || 0;
-  const rug     = token.rug_ratio    || 1;
-  const bundle  = token.bundler_trader_amount_rate || 1;
-  const smart   = token.smart_degen_count || 0;
-  const top10   = token.top_10_holder_rate || 0;
+  const holders  = token.holder_count || 0;
+  const liq      = token.liquidity    || 0;
+  const rug      = token.rug_ratio    || 1;
+  const bundle   = token.bundler_trader_amount_rate || 1;
+  const smart    = token.smart_degen_count || 0;
+  const top10    = token.top_10_holder_rate || 0;
   const antiFarm = holders > 500 && (token.volume||0) < 10000;
 
   if (holders < 40)   return false;
@@ -116,21 +116,38 @@ function hardFilter(token) {
 
 function calcFinalScore(token, aiConf, insiderCount) {
   let s = 0;
-  const smart=token.smart_degen_count||0, kol=token.renowned_count||0;
-  const rug=token.rug_ratio||1, liq=token.liquidity||0;
-  const buys=token.buy_5m||token.swaps_5m||0, sells=token.sell_5m||0;
+  // Use fields that exist in both public API and OpenAPI responses
+  const smart  = token.smart_degen_count || 0;
+  const kol    = token.renowned_count    || 0;
+  const rug    = token.rug_ratio         || 0;
+  const liq    = token.liquidity         || 0;
+  const vol    = token.volume            || 0;
+  const chg1h  = token.price_change_percent1h || 0;
+
+  // Smart money signals (available from public API)
   if (smart>=3) s+=3; else if (smart>=1) s+=2;
-  if (kol>=2) s+=2; else if (kol>=1) s+=1;
-  if (liq>15000) s+=2;
-  if (buys>sells*1.5) s+=2;
-  if (token.creator_token_status==="hold") s+=1;
-  if (token.renounced_mint===1) s+=1;
-  if (token.is_wash_trading) s-=3;
+  if (kol>=2)   s+=2; else if (kol>=1)   s+=1;
+
+  // Liquidity signals (available in OpenAPI)
+  if (liq>15000) s+=2; else if (liq>7000) s+=1;
+
+  // Volume momentum
+  if (vol>50000) s+=2; else if (vol>20000) s+=1;
+
+  // Price momentum
+  if (chg1h>50)  s+=2;
+  else if (chg1h>10) s+=1;
+  else if (chg1h<-50) s-=2;
+
+  // Security signals (only if available)
   if (rug>0.20) s-=3;
   if ((token.bundler_trader_amount_rate||0)>0.25) s-=2;
-  if ((token.holder_count||0)<50) s-=2;
-  if (liq<8000) s-=2;
+  if (token.is_wash_trading) s-=3;
   if (token.creator_token_status==="sell") s-=2;
+  if (token.creator_token_status==="hold") s+=1;
+  if (token.renounced_mint===1) s+=1;
+
+  // AI confidence bonus
   s += Math.floor((aiConf||50)/20);
   if (getVelocity(token)>=1.5) s+=1;
   s += insiderCount;
@@ -344,6 +361,36 @@ async function fetchOpenAPI(subPath, params={}, method="GET") {
   } catch(e) { log(`OpenAPI error: ${e.message}`); return null; }
 }
 
+// ─── TOKEN ENRICHMENT — fetch security fields for KOL tokens ─────────────────
+async function enrichToken(token) {
+  try {
+    const data = await fetchOpenAPI("/v1/token/security", {
+      chain: "sol",
+      address: token.address
+    });
+    if (!data?.data) return token;
+    const s = data.data;
+    // Log fields on first call to verify
+    log(`Security fields: ${JSON.stringify(Object.keys(s)).slice(0,200)}`);
+    // Merge security fields into token
+    return {
+      ...token,
+      rug_ratio:                  s.rug_ratio                  ?? token.rug_ratio,
+      smart_degen_count:          s.smart_degen_count          ?? token.smart_degen_count,
+      renowned_count:             s.renowned_count             ?? token.renowned_count,
+      holder_count:               s.holder_count               ?? token.holder_count,
+      bundler_trader_amount_rate: s.bundler_trader_amount_rate ?? token.bundler_trader_amount_rate,
+      top_10_holder_rate:         s.top_10_holder_rate         ?? token.top_10_holder_rate,
+      renounced_mint:             s.renounced_mint             ?? token.renounced_mint,
+      creator_token_status:       s.creator_token_status       ?? token.creator_token_status,
+      is_wash_trading:            s.is_wash_trading            ?? token.is_wash_trading,
+    };
+  } catch(e) {
+    log(`Enrich error for ${token.address?.slice(0,8)}: ${e.message}`);
+    return token;
+  }
+}
+
 // ─── KOL SIGNALS ─────────────────────────────────────────────────────────────
 async function getKOLSignals() {
   const seen=new Set(), results=[];
@@ -368,7 +415,16 @@ async function getKOLSignals() {
       if (data) processKOLList(extractList(data),seen,results);
     }
   }
-  return results.sort((a,b)=>(b.smart_degen_count||0)-(a.smart_degen_count||0));
+  // Enrich top 15 results with security fields
+  const sorted = results.sort((a,b)=>(b.smart_degen_count||0)-(a.smart_degen_count||0));
+  const top = sorted.slice(0, 15);
+  log(`Enriching ${top.length} KOL tokens with security data...`);
+  const enriched = await Promise.all(top.map(t => enrichToken(t)));
+  // Log first enriched token to verify fields
+  if (enriched.length > 0) {
+    log(`Enriched token sample - smart:${enriched[0].smart_degen_count} rug:${enriched[0].rug_ratio} holders:${enriched[0].holder_count} bundle:${enriched[0].bundler_trader_amount_rate}`);
+  }
+  return enriched;
 }
 
 function extractList(data) {
@@ -642,12 +698,12 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("🚀 KOL Tracker ELITE — v12 filters + new endpoints");
+  log("🚀 KOL Tracker ELITE v3 TEST — token enrichment");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `🚀 *KOL Tracker ELITE Online*\n\n`+
+    `🚀 *KOL Tracker ELITE v3 TEST Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🔒 Original v12 filters restored\n`+
