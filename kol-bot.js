@@ -93,23 +93,25 @@ function signalLabel(s) {
   return "LOW";
 }
 
-// ─── HARD FILTER — restored original v12 (enriched tokens have all fields) ────
+// ─── HARD FILTER — using confirmed fields from enrichment ────────────────────
+// Confirmed in /v1/token/security: top_10_holder_rate, is_honeypot, is_blacklist
+// Confirmed in /v1/market/rank: liquidity, volume, market_cap
+// NOT available: bundler_trader_amount_rate, smart_degen_count, holder_count
 function hardFilter(token) {
-  const holders  = token.holder_count || 0;
-  const liq      = token.liquidity    || 0;
-  const rug      = token.rug_ratio    || 1;
-  const bundle   = token.bundler_trader_amount_rate || 1;
-  const smart    = token.smart_degen_count || 0;
+  const liq      = token.liquidity         || 0;
+  const mc       = token.market_cap        || 0;
   const top10    = token.top_10_holder_rate || 0;
-  const antiFarm = holders > 500 && (token.volume||0) < 10000;
+  const honeypot = token.is_honeypot       || false;
+  const blacklisted = token.is_blacklist   || false;
+  const vol      = token.volume            || 0;
 
-  if (holders < 40)   return false;
-  if (liq < 7000)     return false;
-  if (rug > 0.18)     return false;
-  if (bundle > 0.25)  return false;
-  if (smart === 0)    return false;
-  if (top10 > 0.35)   return false;
-  if (antiFarm)       return false;
+  if (liq < 5000)       return false;  // no liquidity
+  if (vol < 1000)       return false;  // no volume
+  if (mc < MC_MIN)      return false;  // too small
+  if (mc > MC_MAX)      return false;  // too large
+  if (honeypot)         return false;  // honeypot
+  if (blacklisted)      return false;  // blacklisted
+  if (top10 > 0.50)     return false;  // too concentrated
   if (blacklist.has(token.creator||"")) return false;
   return true;
 }
@@ -370,20 +372,22 @@ async function enrichToken(token) {
     });
     if (!data?.data) return token;
     const s = data.data;
-    // Log fields on first call to verify
-    log(`Security fields: ${JSON.stringify(Object.keys(s)).slice(0,200)}`);
-    // Merge security fields into token
+    // Correct field names from actual /v1/token/security response:
+    // top_10_holder_rate, burn_ratio, burn_status, is_honeypot,
+    // open_source, is_blacklist, dev_token_burn_ratio
+    // NOTE: rug_ratio, smart_degen_count, bundler_trader_amount_rate
+    // are NOT in this endpoint — use token_info instead
     return {
       ...token,
-      rug_ratio:                  s.rug_ratio                  ?? token.rug_ratio,
-      smart_degen_count:          s.smart_degen_count          ?? token.smart_degen_count,
-      renowned_count:             s.renowned_count             ?? token.renowned_count,
-      holder_count:               s.holder_count               ?? token.holder_count,
-      bundler_trader_amount_rate: s.bundler_trader_amount_rate ?? token.bundler_trader_amount_rate,
-      top_10_holder_rate:         s.top_10_holder_rate         ?? token.top_10_holder_rate,
-      renounced_mint:             s.renounced_mint             ?? token.renounced_mint,
-      creator_token_status:       s.creator_token_status       ?? token.creator_token_status,
-      is_wash_trading:            s.is_wash_trading            ?? token.is_wash_trading,
+      top_10_holder_rate:   s.top_10_holder_rate   ?? token.top_10_holder_rate,
+      burn_ratio:           s.burn_ratio            ?? 0,
+      burn_status:          s.burn_status           ?? token.burn_status,
+      is_honeypot:          s.is_honeypot           ?? false,
+      open_source:          s.open_source           ?? token.open_source,
+      is_blacklist:         s.is_blacklist          ?? false,
+      dev_token_burn_ratio: s.dev_token_burn_ratio  ?? 0,
+      // rug_ratio not in security endpoint — keep existing value
+      rug_ratio:            token.rug_ratio         ?? 0,
     };
   } catch(e) {
     log(`Enrich error for ${token.address?.slice(0,8)}: ${e.message}`);
@@ -422,7 +426,7 @@ async function getKOLSignals() {
   const enriched = await Promise.all(top.map(t => enrichToken(t)));
   // Log first enriched token to verify fields
   if (enriched.length > 0) {
-    log(`Enriched token sample - smart:${enriched[0].smart_degen_count} rug:${enriched[0].rug_ratio} holders:${enriched[0].holder_count} bundle:${enriched[0].bundler_trader_amount_rate}`);
+    log(`Enriched token sample - top10:${enriched[0].top_10_holder_rate} honeypot:${enriched[0].is_honeypot} blacklist:${enriched[0].is_blacklist} burn:${enriched[0].burn_status}`);
   }
   return enriched;
 }
@@ -698,12 +702,12 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("🚀 KOL Tracker ELITE v3 TEST — token enrichment");
+  log("🚀 KOL Tracker ELITE v4 TEST — correct security fields");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `🚀 *KOL Tracker ELITE v3 TEST Online*\n\n`+
+    `🚀 *KOL Tracker ELITE v4 TEST Online*\n\n`+
     `📡 Dual source: Public API + OpenAPI fallback\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🔒 Original v12 filters restored\n`+
