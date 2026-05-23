@@ -312,12 +312,20 @@ const ipv4Agent=new https.Agent({family:4,keepAlive:true});
 const axiosAPI=axios.create({httpsAgent:ipv4Agent,timeout:20000,validateStatus:()=>true});
 
 // SOL launchpad platforms + quote address types from official GMGN client
+// All launchpad platforms — bonding curve only (no DEX pools)
 const SOL_LAUNCHPAD_PLATFORMS = [
+  // Pump.fun family
   "Pump.fun","pump_mayhem","pump_mayhem_agent","pump_agent",
-  "letsbonk","bonkers","bags","memoo","liquid","bankr","zora",
-  "surge","anoncoin","moonshot_app","wendotdev","heaven","sugar",
-  "token_mill","believe","trendsfun","trends_fun","jup_studio",
-  "Moonshot","boop","ray_launchpad","meteora_virtual_curve","xstocks",
+  // letsbonk family
+  "letsbonk","bonkers","bags",
+  // Other launchpads
+  "memoo","liquid","bankr","zora","surge","anoncoin",
+  "moonshot_app","wendotdev","heaven","sugar","token_mill",
+  "believe","trendsfun","trends_fun","jup_studio","Moonshot",
+  "boop","xstocks",
+  // DEX pools included for completed tokens only
+  "ray_launchpad","meteora_virtual_curve",
+  "pool_ray","pool_meteora","pool_pump_amm","pool_orca",
 ];
 const SOL_QUOTE_ADDRESS_TYPES = [4,5,3,1,13,0];
 
@@ -558,6 +566,23 @@ function processUltraList(list, seen, results) {
   }
 }
 
+// ─── DEX PROMOTION HELPER ────────────────────────────────────────────────────
+function getDexPromo(token) {
+  const ad      = token.dexscr_ad          === 1 || token.dexscr_ad      === true;
+  const trending = token.dexscr_trending_bar === 1 || token.dexscr_trending_bar === true;
+  const boost   = parseFloat(token.dexscr_boost_fee || 0) > 0;
+  const updated = token.dexscr_update_link  === 1 || token.dexscr_update_link  === true;
+
+  const promos = [];
+  if (ad)       promos.push("Ad");
+  if (trending) promos.push("Trending Bar");
+  if (boost)    promos.push(`Boost $${token.dexscr_boost_fee}`);
+  if (updated)  promos.push("Links Updated");
+
+  if (promos.length === 0) return "❌ No paid promotion";
+  return `✅ ${promos.join(" + ")}`;
+}
+
 // ─── KEYBOARD ─────────────────────────────────────────────────────────────────
 function buildKeyboard(mint,isPump) {
   return {inline_keyboard:[
@@ -598,7 +623,8 @@ async function sendKOLAlert(token,ai) {
     `└ Netflow: ${netflow}${insiderStr}\n\n`+
     `🔒 *Security*\n`+
     `├ Dev: ${devStatus} | Mint: ${token.renounced_mint===1?"🟢 Yes":"🔴 No"}\n`+
-    `└ Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n\n`+
+    `├ Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
+    `└ 📢 DEX: ${getDexPromo(token)}\n\n`+
     `💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,false)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol");
@@ -619,7 +645,8 @@ async function sendPumpAlert(token,ai) {
     `└ ⏱ ${fmtAge(token.open_timestamp?token.open_timestamp*1000:null)} | 👁 ${token.holder_count||"N/A"} holders\n\n`+
     `🏦 *Bonding Curve*\n[${bar}] ${progress.toFixed(1)}%\n\n`+
     `📊 Price: ${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC: ${fmt(token.market_cap||0)}\n`+
-    `Vol: ${fmt(token.volume||0)} | Smart: ${token.smart_degen_count||0} 🤖 | KOL: ${token.renowned_count||0} 👑\n\n`+
+    `Vol: ${fmt(token.volume||0)} | Smart: ${token.smart_degen_count||0} 🤖 | KOL: ${token.renowned_count||0} 👑\n`+
+    `📢 DEX: ${getDexPromo(token)}\n\n`+
     `⚡ Buy before Raydium migration!\n💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump");
@@ -645,7 +672,8 @@ async function sendUltraAlert(token,ai) {
     `├ Buys: ${token.buys||0} | Sells: ${token.sells||0}\n`+
     `└ B/S:  ${token.buyRatio?token.buyRatio.toFixed(1):"N/A"}:1\n\n`+
     `📊 Price: ${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC: ${fmt(token.market_cap||0)}\n`+
-    `Smart: ${token.smart_degen_count||0} 🤖 | Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n\n`+
+    `Smart: ${token.smart_degen_count||0} 🤖 | Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
+    `📢 DEX: ${getDexPromo(token)}\n\n`+
     `💰 *Snipe 0.1 SOL?* — Always DYOR`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra");
@@ -702,13 +730,13 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("🚀 KOL Tracker ELITE v4 TEST — correct security fields");
+  log("🚀 KOL Tracker ALL PLATFORM v2 — DEX promo indicator");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `🚀 *KOL Tracker ELITE v4 TEST Online*\n\n`+
-    `📡 Dual source: Public API + OpenAPI fallback\n`+
+    `🚀 *KOL Tracker ALL PLATFORM v2 Online*\n\n`+
+    `📡 All platforms: Pump.fun + letsbonk + bonkers + bags + more\n`+
     `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
     `🔒 Original v12 filters restored\n`+
     `🛡️ Ultra Early: strict security checks\n`+
