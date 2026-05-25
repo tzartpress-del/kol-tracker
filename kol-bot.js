@@ -14,6 +14,8 @@ const CHAT_ID        = process.env.CHAT_ID;
 const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const GMGN_API_KEY   = process.env.GMGN_API_KEY;
+const SUPABASE_URL   = process.env.SUPABASE_URL || "https://ksulmvlrmwpalgqzlxjt.supabase.co";
+const SUPABASE_KEY   = process.env.SUPABASE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtzdWxtdmxybXdwYWxncXpseGp0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3MzQ0NzAsImV4cCI6MjA5NTMxMDQ3MH0.lbVBCzcYrpbGp5J-m1Xz33sTf7k799A8md0pWIJfXYw";
 
 // ─── ORIGINAL V12 FILTERS ────────────────────────────────────────────────────
 const MC_MIN              = 15000;
@@ -186,6 +188,47 @@ Blacklisted creators: ${blacklistedCreators.size}`,
   } catch(e) {}
 });
 
+// ─── SUPABASE HELPERS ────────────────────────────────────────────────────────
+async function dbInsert(table, data) {
+  try {
+    await axios.post(
+      `${SUPABASE_URL}/rest/v1/${table}`,
+      data,
+      {
+        headers: {
+          "apikey": SUPABASE_KEY,
+          "Authorization": `Bearer ${SUPABASE_KEY}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal"
+        },
+        timeout: 8000
+      }
+    );
+  } catch(e) {
+    log(`Supabase insert error: ${e.message}`);
+  }
+}
+
+async function dbUpdate(table, match, data) {
+  try {
+    await axios.patch(
+      `${SUPABASE_URL}/rest/v1/${table}?mint=eq.${match}`,
+      data,
+      {
+        headers: {
+          "apikey": SUPABASE_KEY,
+          "Authorization": `Bearer ${SUPABASE_KEY}`,
+          "Content-Type": "application/json",
+          "Prefer": "return=minimal"
+        },
+        timeout: 8000
+      }
+    );
+  } catch(e) {
+    log(`Supabase update error: ${e.message}`);
+  }
+}
+
 // ─── CREATOR RUG CHECK ───────────────────────────────────────────────────────
 const PF_API = "https://frontend-api-v3.pump.fun";
 
@@ -338,6 +381,13 @@ async function trackPerformance(mint,alertPrice,alertMC,symbol,alertMsgId,signal
     if (Date.now()-tracker.alertTime>86400000) {
       const v=tracker.peakX>=10?"🌙 MOONSHOT":tracker.peakX>=5?"🔥 BANGER":tracker.peakX>=2?"✅ WIN":tracker.peakX>=1?"🟡 BREAKEVEN":"🔴 RUG";
       await bot.sendMessage(CHAT_ID,`📋 *24hr* $${symbol}\nPeak: ${tracker.peakX.toFixed(2)}x — ${v}`,{parse_mode:"Markdown"}).catch(()=>{});
+      // Save outcome to Supabase
+      dbInsert("outcomes", {
+        mint, symbol, signal_type:tracker.signalType,
+        peak_x: tracker.peakX,
+        result: v.replace(/[^a-zA-Z0-9 ]/g,"").trim(),
+        alert_price: tracker.alertPrice,
+      }).catch(()=>{});
       performanceTracker.delete(mint);clearInterval(interval);return;
     }
     const cur=await getTokenPrice(mint);
@@ -714,6 +764,17 @@ async function sendKOLAlert(token,ai) {
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol");
   botStats.kol.alerts++;
   log(`KOL: $${sym} score:${score} smart:${token.smart_degen_count||0} kol:${token.renowned_count||0}`);
+  // Save to Supabase
+  dbInsert("signals", {
+    mint, symbol:sym, signal_type:"KOL",
+    alert_price: token.price ? parseFloat(token.price) : null,
+    alert_mc: token.market_cap || null,
+    smart_degen_count: token.smart_degen_count || 0,
+    rug_ratio: token.rug_ratio || 0,
+    ai_decision: ai.decision,
+    ai_confidence: ai.confidence || 0,
+    has_socials: !!(token.twitter||token.telegram||token.website),
+  }).catch(()=>{});
 }
 
 async function sendPumpAlert(token,ai) {
@@ -737,6 +798,16 @@ async function sendPumpAlert(token,ai) {
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump");
   botStats.pump.alerts++;
   log(`Pump: $${sym} ${progress.toFixed(0)}%`);
+  dbInsert("signals", {
+    mint, symbol:sym, signal_type:"PUMP",
+    alert_price: token.price ? parseFloat(token.price) : null,
+    alert_mc: token.market_cap || null,
+    smart_degen_count: token.smart_degen_count || 0,
+    rug_ratio: token.rug_ratio || 0,
+    ai_decision: ai.decision,
+    ai_confidence: ai.confidence || 0,
+    has_socials: !!(token.twitter||token.telegram||token.website),
+  }).catch(()=>{});
 }
 
 async function sendUltraAlert(token,ai) {
@@ -765,6 +836,16 @@ async function sendUltraAlert(token,ai) {
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra");
   botStats.ultra.alerts++;
   log(`Ultra: $${sym} age:${ageMin}m ratio:${token.buyRatio?.toFixed(1)}`);
+  dbInsert("signals", {
+    mint, symbol:sym, signal_type:"ULTRA",
+    alert_price: token.price ? parseFloat(token.price) : null,
+    alert_mc: token.market_cap || null,
+    smart_degen_count: token.smart_degen_count || 0,
+    rug_ratio: token.rug_ratio || 0,
+    ai_decision: ai.decision,
+    ai_confidence: ai.confidence || 0,
+    has_socials: !!(token.twitter||token.telegram||token.website),
+  }).catch(()=>{});
 }
 
 // ─── MAIN SCAN ────────────────────────────────────────────────────────────────
@@ -828,17 +909,18 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v2 — Social warnings added");
+  log("⚡ Apex v3 — Supabase signal tracking");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v2 Online*\n\n`+
+    `⚡ *Apex v3 Online*\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 3 Signals: KOL + Pump + Ultra Early\n`+
     `🤖 AI: OpenRouter Llama 3.3 70B (200/day)\n`+
     `🌐 Social warnings on all alerts\n`+
+    `💾 Supabase signal tracking enabled\n`+
     `👤 Creator rug rate check\n`+
     `🔍 Copycat detection\n`+
     `👛 6 Insider wallets tracked\n`+
