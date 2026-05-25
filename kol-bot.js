@@ -633,6 +633,21 @@ function processUltraList(list, seen, results) {
   }
 }
 
+// ─── SOCIALS HELPER ──────────────────────────────────────────────────────────
+function getSocials(token) {
+  const parts = [];
+  const tw = token.twitter || token.twitter_username;
+  const tg = token.telegram;
+  const web = token.website;
+
+  if (tw)  parts.push(`[X](${tw.startsWith("http") ? tw : "https://x.com/"+tw})`);
+  if (tg)  parts.push(`[TG](${tg.startsWith("http") ? tg : "https://t.me/"+tg})`);
+  if (web) parts.push(`[Web](${web})`);
+
+  if (parts.length === 0) return "No socials ⚠️";
+  return parts.join(" | ");
+}
+
 // ─── DEX PROMOTION HELPER ────────────────────────────────────────────────────
 function getDexPromo(token) {
   const ad      = token.dexscr_ad          === 1 || token.dexscr_ad      === true;
@@ -692,7 +707,8 @@ async function sendKOLAlert(token,ai) {
     `🔒 *Security*\n`+
     `├ Dev: ${devStatus} | Mint: ${token.renounced_mint===1?"🟢 Yes":"🔴 No"}\n`+
     `├ Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
-    `└ 📢 DEX: ${getDexPromo(token)}\n\n`+
+    `├ 📢 DEX: ${getDexPromo(token)}\n`+
+    `└ 🌐 ${getSocials(token)}\n\n`+
     `💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,false)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol");
@@ -714,7 +730,8 @@ async function sendPumpAlert(token,ai) {
     `🏦 *Bonding Curve*\n[${bar}] ${progress.toFixed(1)}%\n\n`+
     `📊 Price: ${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC: ${fmt(token.market_cap||0)}\n`+
     `Vol: ${fmt(token.volume||0)} | Smart: ${token.smart_degen_count||0} 🤖 | KOL: ${token.renowned_count||0} 👑\n`+
-    `📢 DEX: ${getDexPromo(token)}\n\n`+
+    `📢 DEX: ${getDexPromo(token)}\n`+
+    `🌐 ${getSocials(token)}\n\n`+
     `⚡ Buy before Raydium migration!\n💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump");
@@ -741,7 +758,8 @@ async function sendUltraAlert(token,ai) {
     `└ B/S:  ${token.buyRatio?token.buyRatio.toFixed(1):"N/A"}:1\n\n`+
     `📊 Price: ${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC: ${fmt(token.market_cap||0)}\n`+
     `Smart: ${token.smart_degen_count||0} 🤖 | Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
-    `📢 DEX: ${getDexPromo(token)}\n\n`+
+    `📢 DEX: ${getDexPromo(token)}\n`+
+    `🌐 ${getSocials(token)}\n\n`+
     `💰 *Snipe 0.1 SOL?* — Always DYOR`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra");
@@ -810,16 +828,17 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex Alpha Bot — OpenRouter + Creator Check + Copycat Detection");
+  log("⚡ Apex v2 — Social warnings added");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex Alpha Bot Online*\n\n`+
+    `⚡ *Apex v2 Online*\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 3 Signals: KOL + Pump + Ultra Early\n`+
     `🤖 AI: OpenRouter Llama 3.3 70B (200/day)\n`+
+    `🌐 Social warnings on all alerts\n`+
     `👤 Creator rug rate check\n`+
     `🔍 Copycat detection\n`+
     `👛 6 Insider wallets tracked\n`+
