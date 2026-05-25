@@ -11,7 +11,7 @@ dns.setDefaultResultOrder("ipv4first");
 // ─── CONFIG ───────────────────────────────────────────────────────────────────
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID        = process.env.CHAT_ID;
-const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
+const OPENROUTER_KEY = process.env.OPENROUTER_KEY;
 const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 
@@ -35,20 +35,24 @@ const ULTRA_MIN_VOLUME    = 3000;
 const ULTRA_MIN_HOLDERS   = 30;
 const ULTRA_MIN_BUY_RATIO = 2;
 
-const CLAUDE_DAILY_LIMIT  = 50;
+const OPENROUTER_MODEL    = "meta-llama/llama-3.3-70b-instruct:free";
+const AI_DAILY_LIMIT      = 200;
+const AI_CACHE_TTL        = 1800000;
 
 // ─── STATE ────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 const globalAlerted      = new Set();
 const alerted            = new Map();
-const claudeCache        = new Map();
+const aiCache            = new Map();
 const performanceTracker = new Map();
 const insiderBuys        = {};
 const lastSig            = {};
 const blacklist          = new Set();
 let lastOpenAPICall      = 0;
-let claudeCallsToday     = 0;
-let claudeResetTime      = Date.now() + 86400000;
+let aiCallsToday         = 0;
+let aiResetTime          = Date.now() + 86400000;
+const blacklistedCreators = new Set();
+const creatorCache        = new Map();
 
 const botStats = {
   kol:   { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
@@ -174,45 +178,108 @@ bot.on("callback_query", async (q) => {
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
-        `Claude: ${claudeCallsToday}/${CLAUDE_DAILY_LIMIT} | Tracking: ${performanceTracker.size}`,
+        `AI: ${aiCallsToday}/${AI_DAILY_LIMIT} | Tracking: ${performanceTracker.size}
+Blacklisted creators: ${blacklistedCreators.size}`,
         { parse_mode:"Markdown" }
       );
     }
   } catch(e) {}
 });
 
-// ─── CLAUDE ───────────────────────────────────────────────────────────────────
-async function claudeFilter(token) {
-  if (Date.now()>claudeResetTime) { claudeCallsToday=0; claudeResetTime=Date.now()+86400000; }
-  const cached=claudeCache.get(token.address);
-  if (cached&&Date.now()-cached.ts<1800000) return cached.result;
-  const rug=token.rug_ratio||0, smart=token.smart_degen_count||0, liq=token.liquidity||0;
-  if (rug>0.5)               return { decision:"REJECT", reason:"Rug>50%",     risk:"VERY HIGH", confidence:99 };
-  if (liq<3000)              return { decision:"REJECT", reason:"Liq too low",  risk:"VERY HIGH", confidence:99 };
-  if (token.is_wash_trading) return { decision:"REJECT", reason:"Wash trading", risk:"VERY HIGH", confidence:99 };
-  if (smart>=3&&rug<0.1) {
-    const r={decision:"APPROVE",reason:"Strong smart money",risk:"LOW",confidence:92};
-    claudeCache.set(token.address,{result:r,ts:Date.now()}); return r;
+// ─── CREATOR RUG CHECK ───────────────────────────────────────────────────────
+const PF_API = "https://frontend-api-v3.pump.fun";
+
+async function fetchCreatorProfile(wallet) {
+  if (creatorCache.has(wallet)) return creatorCache.get(wallet);
+  try {
+    const res = await axios.get(
+      `${PF_API}/coins?creator=${wallet}&limit=50&offset=0&includeNsfw=true`,
+      { timeout:10000, headers:{"Accept":"application/json"} }
+    );
+    const profile = { wallet, totalLaunches:0, scamEstimate:0, rugRate:0 };
+    if (Array.isArray(res.data)) {
+      const coins = res.data;
+      profile.totalLaunches = coins.length;
+      profile.scamEstimate  = coins.filter(c => !Boolean(c.complete) && Number(c.usd_market_cap||0) < 500).length;
+      profile.rugRate       = coins.length > 0 ? profile.scamEstimate / coins.length : 0;
+      if (profile.rugRate > 0.5 && profile.totalLaunches >= 3) {
+        blacklistedCreators.add(wallet);
+        log(`Blacklisted creator ${wallet.slice(0,8)} — rug rate ${(profile.rugRate*100).toFixed(0)}%`);
+      }
+    }
+    creatorCache.set(wallet, profile);
+    setTimeout(() => creatorCache.delete(wallet), 120000);
+    return profile;
+  } catch(e) {
+    return { wallet, totalLaunches:0, scamEstimate:0, rugRate:0 };
   }
-  if (!CLAUDE_API_KEY||claudeCallsToday>=CLAUDE_DAILY_LIMIT)
+}
+
+async function checkCopycat(name, symbol, excludeMint) {
+  try {
+    const q = encodeURIComponent(symbol||name);
+    const res = await axios.get(`https://api.dexscreener.com/latest/dex/search?q=${q}`, { timeout:8000 });
+    const pairs = res.data?.pairs || [];
+    const nameLower = (name||"").toLowerCase();
+    const symLower  = (symbol||"").toLowerCase();
+    return pairs.filter(p => {
+      if (p.chainId !== "solana") return false;
+      const b = p.baseToken || {};
+      if ((b.address||"").toLowerCase() === excludeMint?.toLowerCase()) return false;
+      return (b.name||"").toLowerCase()===nameLower || (b.symbol||"").toLowerCase()===symLower;
+    }).length;
+  } catch(e) { return 0; }
+}
+
+// ─── AI FILTER (OpenRouter) ───────────────────────────────────────────────────
+async function claudeFilter(token) {
+  if (Date.now()>aiResetTime) { aiCallsToday=0; aiResetTime=Date.now()+86400000; }
+  const cached=aiCache.get(token.address);
+  if (cached&&Date.now()-cached.ts<AI_CACHE_TTL) return cached.result;
+
+  const rug=token.rug_ratio||0, smart=token.smart_degen_count||0, liq=token.liquidity||0;
+  if (rug>0.5)               return cacheAI(token.address, { decision:"REJECT", reason:"Rug>50%", risk:"VERY HIGH", confidence:99 });
+  if (liq<3000)              return cacheAI(token.address, { decision:"REJECT", reason:"No liquidity", risk:"VERY HIGH", confidence:99 });
+  if (token.is_wash_trading) return cacheAI(token.address, { decision:"REJECT", reason:"Wash trading", risk:"VERY HIGH", confidence:99 });
+  if (token.is_honeypot)     return cacheAI(token.address, { decision:"REJECT", reason:"Honeypot", risk:"VERY HIGH", confidence:99 });
+  if (smart>=3&&rug<0.1) {
+    return cacheAI(token.address, {decision:"APPROVE",reason:"Strong smart money",risk:"LOW",confidence:92});
+  }
+  if (!OPENROUTER_KEY||aiCallsToday>=AI_DAILY_LIMIT)
     return {decision:"APPROVE",reason:"AI limit",risk:"MEDIUM",confidence:50};
   try {
-    claudeCallsToday++;
-    const res=await axios.post("https://api.anthropic.com/v1/messages",
-      { model:"claude-haiku-4-5-20251001", max_tokens:80,
+    aiCallsToday++;
+    const res=await axios.post(
+      "https://openrouter.ai/api/v1/chat/completions",
+      {
+        model: OPENROUTER_MODEL,
+        max_tokens: 80,
         messages:[{role:"user",content:
-          `Solana memecoin. Be LENIENT. Only reject clear rugs.\n${token.symbol} MC:$${token.market_cap} Liq:$${liq} Smart:${smart} Rug:${(rug*100).toFixed(0)}%\nREJECT only rug>40% or wash trading. JSON: {"decision":"APPROVE","reason":"brief","risk":"LOW/MEDIUM/HIGH","confidence":75}`
+          `Solana memecoin. Be LENIENT. Only reject clear rugs.\n$${token.symbol} MC:$${Math.round(token.market_cap||0)} Liq:$${Math.round(liq)} Smart:${smart} Rug:${(rug*100).toFixed(0)}%\nREJECT only rug>40% or wash trading. JSON only: {"decision":"APPROVE","reason":"brief","risk":"LOW","confidence":75}`
         }]
       },
-      { headers:{"x-api-key":CLAUDE_API_KEY,"anthropic-version":"2023-06-01","content-type":"application/json"}, timeout:10000 }
+      {
+        headers:{
+          "Authorization":`Bearer ${OPENROUTER_KEY}`,
+          "Content-Type":"application/json",
+          "HTTP-Referer":"https://apex-bot.railway.app",
+          "X-Title":"Apex Alpha Bot"
+        },
+        timeout:15000
+      }
     );
-    const r=JSON.parse((res.data?.content?.[0]?.text||"").replace(/```json|```/g,"").trim());
-    claudeCache.set(token.address,{result:r,ts:Date.now()});
-    log(`Claude: $${token.symbol} → ${r.decision} ${r.risk} ${r.confidence}%`);
-    return r;
+    const text=res.data?.choices?.[0]?.message?.content||"{}";
+    const r=JSON.parse(text.replace(/```json|```/g,"").trim());
+    log(`AI: $${token.symbol} → ${r.decision} ${r.risk} ${r.confidence}%`);
+    return cacheAI(token.address, r);
   } catch(e) {
     return {decision:"APPROVE",reason:"AI unavailable",risk:"MEDIUM",confidence:50};
   }
+}
+
+function cacheAI(addr, result) {
+  aiCache.set(addr, { result, ts:Date.now() });
+  return result;
 }
 
 // ─── INSIDER WALLETS ─────────────────────────────────────────────────────────
@@ -562,7 +629,7 @@ function processUltraList(list, seen, results) {
       buyTax   == 0                   &&
       devBal   <  0.2                 &&
       (burned||smart>=1)
-    ) results.push({...t,alertType:"ULTRA_EARLY",ageMs,progress,buys,sells,buyRatio,market_cap:mc,volume});
+    ) results.push({...t,alertType:"ULTRA_EARLY",_ageMs:ageMs,progress,buys,sells,buyRatio,market_cap:mc,volume});
   }
 }
 
@@ -607,7 +674,8 @@ async function sendKOLAlert(token,ai) {
   const insiderStr=insiders.length>0?`\n└ 👛 ${insiders.join(", ")}`:"";
   const msg=
     `${isReentry?"🔄 *RE-ENTRY SIGNAL*":"🚨 *KOL SIGNAL*"} — ${signalLabel(score)}\n`+
-    `Score: ${score} | AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n\n`+
+    `Score: ${score} | AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n`+
+    `${token._copycatWarning?token._copycatWarning+"\n":""}\n`+
     `*$${sym}*\n\`${mint}\`\n`+
     `└ ⏱ ${fmtAge(token.open_timestamp?token.open_timestamp*1000:null)} | 👁 ${token.holder_count||"N/A"} holders\n\n`+
     `📊 *Token Details*\n`+
@@ -656,7 +724,7 @@ async function sendPumpAlert(token,ai) {
 
 async function sendUltraAlert(token,ai) {
   const mint=token.address, sym=token.symbol||"???";
-  const ageMin=Math.floor((token.ageMs||0)/60000);
+  const ageMin=Math.floor((token._ageMs||token.ageMs||0)/60000);
   const progress=token.progress||0;
   const bar="█".repeat(Math.floor(progress/10))+"░".repeat(10-Math.floor(progress/10));
   const momentum=token.buyRatio>=10?"🔥🔥🔥 INSANE":token.buyRatio>=5?"🔥🔥 VERY HIGH":"🔥 HIGH";
@@ -712,6 +780,19 @@ async function scan() {
     const mint=token.address;
     if (globalAlerted.has(mint)) continue;
     if (alerted.has(mint)&&Date.now()-alerted.get(mint)<ALERT_COOLDOWN_MS) continue;
+    // Creator rug check
+    const creator = token.creator || token.creator_address || "";
+    if (creator && blacklistedCreators.has(creator)) { log(`Blocked blacklisted creator: ${creator.slice(0,8)}`); continue; }
+    if (creator) {
+      await fetchCreatorProfile(creator);
+      if (blacklistedCreators.has(creator)) { log(`Blocked after check: ${creator.slice(0,8)}`); continue; }
+    }
+
+    // Copycat detection
+    const copycats = await checkCopycat(token.name||"", token.symbol||"", mint);
+    if (copycats > 3) { log(`Skipping $${token.symbol} — ${copycats+1} copycats`); continue; }
+    if (copycats > 0) token._copycatWarning = `⚠️ ${copycats+1} tokens named $${token.symbol||"?"}`;
+
     globalAlerted.add(mint);alerted.set(mint,Date.now());
     try {
       if (token._type==="ultra") await sendUltraAlert(token,token._ai);
@@ -730,17 +811,18 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("🚀 KOL Tracker ALL PLATFORM v2 — DEX promo indicator");
+  log("⚡ Apex Alpha Bot — OpenRouter + Creator Check + Copycat Detection");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
+  log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `🚀 *KOL Tracker ALL PLATFORM v2 Online*\n\n`+
-    `📡 All platforms: Pump.fun + letsbonk + bonkers + bags + more\n`+
-    `🎯 3 Signal types: KOL + PumpFun + Ultra Early\n`+
-    `🔒 Original v12 filters restored\n`+
-    `🛡️ Ultra Early: strict security checks\n`+
-    `🤖 Claude AI filter\n`+
+    `⚡ *Apex Alpha Bot Online*\n\n`+
+    `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
+    `🎯 3 Signals: KOL + Pump + Ultra Early\n`+
+    `🤖 AI: OpenRouter Llama 3.3 70B (200/day)\n`+
+    `👤 Creator rug rate check\n`+
+    `🔍 Copycat detection\n`+
     `👛 6 Insider wallets tracked\n`+
     `📊 2x/5x/10x milestone alerts\n\n`+
     `Scanning every 60s 🔥`,
