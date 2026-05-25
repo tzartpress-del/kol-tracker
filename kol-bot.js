@@ -805,7 +805,7 @@ async function scan() {
 
   if (globalAlerted.size>500) [...globalAlerted].slice(0,100).forEach(m=>globalAlerted.delete(m));
   const now=Date.now();
-  for (const [k,v] of claudeCache.entries()){if(now-v.ts>1800000)claudeCache.delete(k);}
+  for (const [k,v] of aiCache.entries()){if(now-v.ts>AI_CACHE_TTL)aiCache.delete(k);}
   for (const [k,ts] of alerted.entries()){if(now-ts>ALERT_COOLDOWN_MS)alerted.delete(k);}
 }
 
