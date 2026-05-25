@@ -788,9 +788,8 @@ async function scan() {
       if (blacklistedCreators.has(creator)) { log(`Blocked after check: ${creator.slice(0,8)}`); continue; }
     }
 
-    // Copycat detection
+    // Copycat detection — warn only, never block
     const copycats = await checkCopycat(token.name||"", token.symbol||"", mint);
-    if (copycats > 3) { log(`Skipping $${token.symbol} — ${copycats+1} copycats`); continue; }
     if (copycats > 0) token._copycatWarning = `⚠️ ${copycats+1} tokens named $${token.symbol||"?"}`;
 
     globalAlerted.add(mint);alerted.set(mint,Date.now());
