@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⚡ Apex Dashboard</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#0a0a0a; color:#ccc; font-family:'Courier New',monospace; font-size:13px; padding:16px; }
+  h1 { color:#00ff41; font-size:18px; margin-bottom:16px; }
+  .grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-bottom:20px; }
+  .card { background:#111; border:1px solid #222; border-radius:6px; padding:14px; }
+  .card .label { font-size:10px; color:#666; text-transform:uppercase; letter-spacing:1px; }
+  .card .value { font-size:24px; color:#fff; margin-top:4px; }
+  .card .value.green { color:#00ff41; }
+  .card .value.red { color:#ff4141; }
+  .card .value.yellow { color:#ffc107; }
+  .card .sub { font-size:11px; color:#666; margin-top:2px; }
+  .section { background:#111; border:1px solid #222; border-radius:6px; margin-bottom:16px; overflow:hidden; }
+  .section-header { padding:10px 14px; border-bottom:1px solid #222; color:#fff; font-size:13px; display:flex; justify-content:space-between; align-items:center; }
+  .section-header span { color:#00ff41; font-size:11px; }
+  table { width:100%; border-collapse:collapse; }
+  th { padding:8px 12px; text-align:left; font-size:10px; color:#666; text-transform:uppercase; border-bottom:1px solid #222; }
+  td { padding:8px 12px; font-size:12px; border-bottom:1px solid #111; }
+  tr:hover td { background:rgba(255,255,255,0.02); }
+  .tag { display:inline-block; padding:2px 6px; border-radius:3px; font-size:10px; font-weight:bold; }
+  .tag-kol { background:rgba(0,255,65,0.15); color:#00ff41; }
+  .tag-ultra { background:rgba(255,193,7,0.15); color:#ffc107; }
+  .tag-pump { background:rgba(79,195,247,0.15); color:#4fc3f7; }
+  .tag-win { background:rgba(0,255,65,0.15); color:#00ff41; }
+  .tag-rug { background:rgba(255,65,65,0.15); color:#ff4141; }
+  .tag-moon { background:rgba(187,134,252,0.15); color:#bb86fc; }
+  .loading { text-align:center; padding:30px; color:#555; }
+  .refresh-btn { background:#1a1a1a; border:1px solid #333; color:#00ff41; padding:6px 14px; border-radius:4px; cursor:pointer; font-family:monospace; font-size:12px; }
+  .refresh-btn:hover { background:#222; }
+  .win-rate { font-size:20px; font-weight:bold; }
+</style>
+</head>
+<body>
+
+<h1>⚡ Apex Alpha Dashboard</h1>
+
+<div class="grid" id="stats-grid">
+  <div class="card"><div class="label">Total Signals</div><div class="value green" id="total-signals">--</div></div>
+  <div class="card"><div class="label">2x+ Win Rate</div><div class="value yellow" id="win-rate">--</div></div>
+  <div class="card"><div class="label">KOL Signals</div><div class="value" id="kol-count">--</div></div>
+  <div class="card"><div class="label">Ultra Early</div><div class="value" id="ultra-count">--</div></div>
+  <div class="card"><div class="label">Best Outcome</div><div class="value" id="best-outcome" style="color:#bb86fc">--</div></div>
+  <div class="card"><div class="label">Rugs Tracked</div><div class="value red" id="rug-count">--</div></div>
+</div>
+
+<div class="section">
+  <div class="section-header">
+    Recent Signals
+    <button class="refresh-btn" onclick="loadData()">↻ Refresh</button>
+  </div>
+  <div id="signals-table"><div class="loading">Loading...</div></div>
+</div>
+
+<div class="section">
+  <div class="section-header">Outcomes <span id="outcomes-count"></span></div>
+  <div id="outcomes-table"><div class="loading">Loading...</div></div>
+</div>
+
+<script>
+const SUPABASE_URL = "https://ksulmvlrmwpalgqzlxjt.supabase.co";
+const SUPABASE_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtzdWxtdmxybXdwYWxncXpseGp0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3MzQ0NzAsImV4cCI6MjA5NTMxMDQ3MH0.lbVBCzcYrpbGp5J-m1Xz33sTf7k799A8md0pWIJfXYw";
+
+async function fetchDB(table, params="") {
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/${table}?${params}`, {
+    headers: {
+      "apikey": SUPABASE_KEY,
+      "Authorization": `Bearer ${SUPABASE_KEY}`
+    }
+  });
+  return res.json();
+}
+
+function timeAgo(ts) {
+  const s = Math.floor((Date.now() - new Date(ts)) / 1000);
+  if (s < 60)    return `${s}s ago`;
+  if (s < 3600)  return `${Math.floor(s/60)}m ago`;
+  if (s < 86400) return `${Math.floor(s/3600)}h ago`;
+  return `${Math.floor(s/86400)}d ago`;
+}
+
+function tagClass(type) {
+  if (!type) return "tag-kol";
+  if (type.includes("KOL")) return "tag-kol";
+  if (type.includes("ULTRA")) return "tag-ultra";
+  if (type.includes("PUMP")) return "tag-pump";
+  return "tag-kol";
+}
+
+function resultClass(result) {
+  if (!result) return "";
+  if (result.includes("MOON")) return "tag-moon";
+  if (result.includes("WIN") || result.includes("BANGER")) return "tag-win";
+  if (result.includes("RUG")) return "tag-rug";
+  return "";
+}
+
+async function loadData() {
+  try {
+    // Load signals
+    const signals = await fetchDB("signals", "order=created_at.desc&limit=50");
+    const outcomes = await fetchDB("outcomes", "order=created_at.desc&limit=50");
+
+    // Stats
+    document.getElementById("total-signals").textContent = signals.length || 0;
+    document.getElementById("kol-count").textContent = signals.filter(s=>s.signal_type==="KOL").length;
+    document.getElementById("ultra-count").textContent = signals.filter(s=>s.signal_type==="ULTRA").length;
+
+    // Win rate from outcomes
+    const wins = outcomes.filter(o => o.peak_x >= 2).length;
+    const winRate = outcomes.length > 0 ? ((wins/outcomes.length)*100).toFixed(0) : 0;
+    document.getElementById("win-rate").textContent = `${winRate}%`;
+    document.getElementById("outcomes-count").textContent = `${outcomes.length} tracked`;
+
+    // Rugs
+    const rugs = outcomes.filter(o => o.result && o.result.includes("RUG")).length;
+    document.getElementById("rug-count").textContent = rugs;
+
+    // Best outcome
+    if (outcomes.length > 0) {
+      const best = outcomes.reduce((a,b) => (a.peak_x||0) > (b.peak_x||0) ? a : b);
+      document.getElementById("best-outcome").textContent = `${(best.peak_x||0).toFixed(1)}x $${best.symbol||"?"}`;
+    }
+
+    // Signals table
+    if (signals.length === 0) {
+      document.getElementById("signals-table").innerHTML = '<div class="loading">No signals yet — bot is running</div>';
+    } else {
+      document.getElementById("signals-table").innerHTML = `
+        <table>
+          <thead><tr><th>Symbol</th><th>Type</th><th>MC</th><th>Smart</th><th>AI</th><th>Socials</th><th>When</th></tr></thead>
+          <tbody>
+            ${signals.map(s => `
+              <tr>
+                <td style="color:#fff">$${s.symbol||"?"}</td>
+                <td><span class="tag ${tagClass(s.signal_type)}">${s.signal_type||"?"}</span></td>
+                <td>$${s.alert_mc ? (s.alert_mc/1000).toFixed(1)+"K" : "N/A"}</td>
+                <td>${s.smart_degen_count||0} 🤖</td>
+                <td style="color:${s.ai_confidence>=80?"#00ff41":s.ai_confidence>=60?"#ffc107":"#ff4141"}">${s.ai_confidence||0}%</td>
+                <td>${s.has_socials?"✅":"❌"}</td>
+                <td style="color:#666">${timeAgo(s.created_at)}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>`;
+    }
+
+    // Outcomes table
+    if (outcomes.length === 0) {
+      document.getElementById("outcomes-table").innerHTML = '<div class="loading">No outcomes yet — tracking active positions</div>';
+    } else {
+      document.getElementById("outcomes-table").innerHTML = `
+        <table>
+          <thead><tr><th>Symbol</th><th>Type</th><th>Peak</th><th>Result</th><th>When</th></tr></thead>
+          <tbody>
+            ${outcomes.map(o => `
+              <tr>
+                <td style="color:#fff">$${o.symbol||"?"}</td>
+                <td><span class="tag ${tagClass(o.signal_type)}">${o.signal_type||"?"}</span></td>
+                <td style="color:${(o.peak_x||0)>=5?"#bb86fc":(o.peak_x||0)>=2?"#00ff41":"#ff4141"}">${(o.peak_x||0).toFixed(2)}x</td>
+                <td><span class="tag ${resultClass(o.result)}">${o.result||"?"}</span></td>
+                <td style="color:#666">${timeAgo(o.created_at)}</td>
+              </tr>
+            `).join("")}
+          </tbody>
+        </table>`;
+    }
+
+  } catch(e) {
+    document.getElementById("signals-table").innerHTML = `<div class="loading">Error: ${e.message}</div>`;
+  }
+}
+
+loadData();
+setInterval(loadData, 30000); // Auto refresh every 30s
+</script>
+</body>
+</html>
