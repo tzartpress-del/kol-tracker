@@ -55,6 +55,7 @@ let aiCallsToday         = 0;
 let aiResetTime          = Date.now() + 86400000;
 const blacklistedCreators = new Set();
 const creatorCache        = new Map();
+const devWalletCache      = new Map(); // NEW: GMGN dev wallet ATH cache
 
 const botStats = {
   kol:   { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
@@ -100,9 +101,6 @@ function signalLabel(s) {
 }
 
 // ─── HARD FILTER — using confirmed fields from enrichment ────────────────────
-// Confirmed in /v1/token/security: top_10_holder_rate, is_honeypot, is_blacklist
-// Confirmed in /v1/market/rank: liquidity, volume, market_cap
-// NOT available: bundler_trader_amount_rate, smart_degen_count, holder_count
 function hardFilter(token) {
   const liq      = token.liquidity         || 0;
   const mc       = token.market_cap        || 0;
@@ -111,20 +109,19 @@ function hardFilter(token) {
   const blacklisted = token.is_blacklist   || false;
   const vol      = token.volume            || 0;
 
-  if (liq < 5000)       return false;  // no liquidity
-  if (vol < 1000)       return false;  // no volume
-  if (mc < MC_MIN)      return false;  // too small
-  if (mc > MC_MAX)      return false;  // too large
-  if (honeypot)         return false;  // honeypot
-  if (blacklisted)      return false;  // blacklisted
-  if (top10 > 0.50)     return false;  // too concentrated
+  if (liq < 5000)       return false;
+  if (vol < 1000)       return false;
+  if (mc < MC_MIN)      return false;
+  if (mc > MC_MAX)      return false;
+  if (honeypot)         return false;
+  if (blacklisted)      return false;
+  if (top10 > 0.50)     return false;
   if (blacklist.has(token.creator||"")) return false;
   return true;
 }
 
 function calcFinalScore(token, aiConf, insiderCount) {
   let s = 0;
-  // Use fields that exist in both public API and OpenAPI responses
   const smart  = token.smart_degen_count || 0;
   const kol    = token.renowned_count    || 0;
   const rug    = token.rug_ratio         || 0;
@@ -132,33 +129,25 @@ function calcFinalScore(token, aiConf, insiderCount) {
   const vol    = token.volume            || 0;
   const chg1h  = token.price_change_percent1h || 0;
 
-  // Smart money signals (available from public API)
   if (smart>=3) s+=3; else if (smart>=1) s+=2;
   if (kol>=2)   s+=2; else if (kol>=1)   s+=1;
-
-  // Liquidity signals (available in OpenAPI)
   if (liq>15000) s+=2; else if (liq>7000) s+=1;
-
-  // Volume momentum
   if (vol>50000) s+=2; else if (vol>20000) s+=1;
-
-  // Price momentum
   if (chg1h>50)  s+=2;
   else if (chg1h>10) s+=1;
   else if (chg1h<-50) s-=2;
-
-  // Security signals (only if available)
   if (rug>0.20) s-=3;
   if ((token.bundler_trader_amount_rate||0)>0.25) s-=2;
   if (token.is_wash_trading) s-=3;
   if (token.creator_token_status==="sell") s-=2;
   if (token.creator_token_status==="hold") s+=1;
   if (token.renounced_mint===1) s+=1;
-
-  // AI confidence bonus
   s += Math.floor((aiConf||50)/20);
   if (getVelocity(token)>=1.5) s+=1;
   s += insiderCount;
+  // NEW: dev wallet quality bonus — proven dev with high ATH
+  if (token._devBestATH >= 1000000) s+=2;      // dev made a 1M+ token before
+  else if (token._devBestATH >= 100000) s+=1;  // dev made a 100K+ token before
   return s;
 }
 
@@ -180,8 +169,8 @@ bot.on("callback_query", async (q) => {
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
-        `AI: ${aiCallsToday}/${AI_DAILY_LIMIT} | Tracking: ${performanceTracker.size}
-Blacklisted creators: ${blacklistedCreators.size}`,
+        `AI: ${aiCallsToday}/${AI_DAILY_LIMIT} | Tracking: ${performanceTracker.size}\n`+
+        `Blacklisted creators: ${blacklistedCreators.size}`,
         { parse_mode:"Markdown" }
       );
     }
@@ -229,7 +218,7 @@ async function dbUpdate(table, match, data) {
   }
 }
 
-// ─── CREATOR RUG CHECK ───────────────────────────────────────────────────────
+// ─── CREATOR RUG CHECK (pump.fun) ────────────────────────────────────────────
 const PF_API = "https://frontend-api-v3.pump.fun";
 
 async function fetchCreatorProfile(wallet) {
@@ -256,6 +245,56 @@ async function fetchCreatorProfile(wallet) {
   } catch(e) {
     return { wallet, totalLaunches:0, scamEstimate:0, rugRate:0 };
   }
+}
+
+// ─── NEW: GMGN DEV WALLET ATH CHECK ──────────────────────────────────────────
+// Uses GMGN wallet created-tokens data to find dev's best historical ATH.
+// This tells us if the dev has ever made a successful coin before.
+// Returns: { bestATH, gradCount, totalTokens, gradRate }
+async function fetchDevWalletQuality(wallet) {
+  if (!wallet) return { bestATH:0, gradCount:0, totalTokens:0, gradRate:0 };
+  if (devWalletCache.has(wallet)) return devWalletCache.get(wallet);
+
+  const result = { bestATH:0, gradCount:0, totalTokens:0, gradRate:0 };
+  try {
+    // GMGN endpoint for tokens created by a wallet
+    const data = await fetchOpenAPI("/v1/wallet/created_tokens", {
+      chain: "sol",
+      wallet: wallet,
+      limit: "50"
+    });
+    const tokens = extractList(data);
+    if (tokens.length > 0) {
+      result.totalTokens = tokens.length;
+      for (const t of tokens) {
+        const ath = t.ath_market_cap || t.max_market_cap || t.usd_market_cap || 0;
+        if (ath > result.bestATH) result.bestATH = ath;
+        // graduated = completed bonding curve / has DEX pool
+        if (t.complete || t.is_graduated || t.graduated) result.gradCount++;
+      }
+      result.gradRate = result.totalTokens > 0 ? result.gradCount / result.totalTokens : 0;
+    }
+  } catch(e) {
+    log(`Dev wallet quality error ${wallet.slice(0,8)}: ${e.message}`);
+  }
+
+  devWalletCache.set(wallet, result);
+  setTimeout(() => devWalletCache.delete(wallet), 300000); // 5 min cache
+  return result;
+}
+
+// Format dev quality for alert display
+function fmtDevQuality(q) {
+  if (!q || q.totalTokens === 0) return "🆕 New dev (no history)";
+  const athStr = q.bestATH >= 1000000 ? `$${(q.bestATH/1000000).toFixed(1)}M`
+               : q.bestATH >= 1000 ? `$${(q.bestATH/1000).toFixed(0)}K`
+               : `$${q.bestATH.toFixed(0)}`;
+  let badge = "";
+  if (q.bestATH >= 1000000)      badge = "🏆 PROVEN";
+  else if (q.bestATH >= 100000)  badge = "✅ Decent";
+  else if (q.gradCount > 0)      badge = "🟡 Some grads";
+  else                            badge = "⚠️ No grads";
+  return `${badge} | Best ATH: ${athStr} | ${q.gradCount}/${q.totalTokens} grad`;
 }
 
 async function checkCopycat(name, symbol, excludeMint) {
@@ -381,7 +420,6 @@ async function trackPerformance(mint,alertPrice,alertMC,symbol,alertMsgId,signal
     if (Date.now()-tracker.alertTime>86400000) {
       const v=tracker.peakX>=10?"🌙 MOONSHOT":tracker.peakX>=5?"🔥 BANGER":tracker.peakX>=2?"✅ WIN":tracker.peakX>=1?"🟡 BREAKEVEN":"🔴 RUG";
       await bot.sendMessage(CHAT_ID,`📋 *24hr* $${symbol}\nPeak: ${tracker.peakX.toFixed(2)}x — ${v}`,{parse_mode:"Markdown"}).catch(()=>{});
-      // Save outcome to Supabase
       dbInsert("outcomes", {
         mint, symbol, signal_type:tracker.signalType,
         peak_x: tracker.peakX,
@@ -428,19 +466,13 @@ async function fetchPublic(url) {
 const ipv4Agent=new https.Agent({family:4,keepAlive:true});
 const axiosAPI=axios.create({httpsAgent:ipv4Agent,timeout:20000,validateStatus:()=>true});
 
-// SOL launchpad platforms + quote address types from official GMGN client
-// All launchpad platforms — bonding curve only (no DEX pools)
 const SOL_LAUNCHPAD_PLATFORMS = [
-  // Pump.fun family
   "Pump.fun","pump_mayhem","pump_mayhem_agent","pump_agent",
-  // letsbonk family
   "letsbonk","bonkers","bags",
-  // Other launchpads
   "memoo","liquid","bankr","zora","surge","anoncoin",
   "moonshot_app","wendotdev","heaven","sugar","token_mill",
   "believe","trendsfun","trends_fun","jup_studio","Moonshot",
   "boop","xstocks",
-  // DEX pools included for completed tokens only
   "ray_launchpad","meteora_virtual_curve",
   "pool_ray","pool_meteora","pool_pump_amm","pool_orca",
 ];
@@ -488,7 +520,6 @@ async function fetchOpenAPI(subPath, params={}, method="GET") {
   } catch(e) { log(`OpenAPI error: ${e.message}`); return null; }
 }
 
-// ─── TOKEN ENRICHMENT — fetch security fields for KOL tokens ─────────────────
 async function enrichToken(token) {
   try {
     const data = await fetchOpenAPI("/v1/token/security", {
@@ -497,11 +528,6 @@ async function enrichToken(token) {
     });
     if (!data?.data) return token;
     const s = data.data;
-    // Correct field names from actual /v1/token/security response:
-    // top_10_holder_rate, burn_ratio, burn_status, is_honeypot,
-    // open_source, is_blacklist, dev_token_burn_ratio
-    // NOTE: rug_ratio, smart_degen_count, bundler_trader_amount_rate
-    // are NOT in this endpoint — use token_info instead
     return {
       ...token,
       top_10_holder_rate:   s.top_10_holder_rate   ?? token.top_10_holder_rate,
@@ -511,7 +537,6 @@ async function enrichToken(token) {
       open_source:          s.open_source           ?? token.open_source,
       is_blacklist:         s.is_blacklist          ?? false,
       dev_token_burn_ratio: s.dev_token_burn_ratio  ?? 0,
-      // rug_ratio not in security endpoint — keep existing value
       rug_ratio:            token.rug_ratio         ?? 0,
     };
   } catch(e) {
@@ -523,7 +548,6 @@ async function enrichToken(token) {
 // ─── KOL SIGNALS ─────────────────────────────────────────────────────────────
 async function getKOLSignals() {
   const seen=new Set(), results=[];
-  // Try public API first
   const pubResponses=await Promise.allSettled([
     fetchPublic(`https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=smart_degen_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`),
     fetchPublic(`https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/1h?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`),
@@ -544,12 +568,10 @@ async function getKOLSignals() {
       if (data) processKOLList(extractList(data),seen,results);
     }
   }
-  // Enrich top 15 results with security fields
   const sorted = results.sort((a,b)=>(b.smart_degen_count||0)-(a.smart_degen_count||0));
   const top = sorted.slice(0, 15);
   log(`Enriching ${top.length} KOL tokens with security data...`);
   const enriched = await Promise.all(top.map(t => enrichToken(t)));
-  // Log first enriched token to verify fields
   if (enriched.length > 0) {
     log(`Enriched token sample - top10:${enriched[0].top_10_holder_rate} honeypot:${enriched[0].is_honeypot} blacklist:${enriched[0].is_blacklist} burn:${enriched[0].burn_status}`);
   }
@@ -737,6 +759,7 @@ async function sendKOLAlert(token,ai) {
   const netflow=(token.buy_5m||0)>(token.sell_5m||0)?"🟢 Accumulating":"🔴 Selling";
   const change1h=token.price_change_percent1h||0;
   const insiderStr=insiders.length>0?`\n└ 👛 ${insiders.join(", ")}`:"";
+  const devQualityStr = token._devQuality ? `\n└ 🧑‍💻 ${fmtDevQuality(token._devQuality)}` : "";
   const msg=
     `${isReentry?"🔄 *RE-ENTRY SIGNAL*":"🚨 *KOL SIGNAL*"} — ${signalLabel(score)}\n`+
     `Score: ${score} | AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n`+
@@ -758,13 +781,12 @@ async function sendKOLAlert(token,ai) {
     `├ Dev: ${devStatus} | Mint: ${token.renounced_mint===1?"🟢 Yes":"🔴 No"}\n`+
     `├ Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
     `├ 📢 DEX: ${getDexPromo(token)}\n`+
-    `└ 🌐 ${getSocials(token)}\n\n`+
+    `└ 🌐 ${getSocials(token)}${devQualityStr}\n\n`+
     `💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,false)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol");
   botStats.kol.alerts++;
   log(`KOL: $${sym} score:${score} smart:${token.smart_degen_count||0} kol:${token.renowned_count||0}`);
-  // Save to Supabase
   dbInsert("signals", {
     mint, symbol:sym, signal_type:"KOL",
     alert_price: token.price ? parseFloat(token.price) : null,
@@ -783,6 +805,7 @@ async function sendPumpAlert(token,ai) {
   const bar="█".repeat(Math.floor(progress/10))+"░".repeat(10-Math.floor(progress/10));
   const urgency=progress>=90?"🔴 MIGRATING SOON":progress>=75?"🟡 FILLING FAST":"🟢 EARLY";
   const riskEmoji=ai.risk==="LOW"?"🟢":ai.risk==="MEDIUM"?"🟡":"🔴";
+  const devQualityStr = token._devQuality ? `🧑‍💻 ${fmtDevQuality(token._devQuality)}\n` : "";
   const msg=
     `🎯 *PUMPFUN PRE-BOND* — ${urgency}\n`+
     `AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n\n`+
@@ -792,7 +815,8 @@ async function sendPumpAlert(token,ai) {
     `📊 Price: ${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC: ${fmt(token.market_cap||0)}\n`+
     `Vol: ${fmt(token.volume||0)} | Smart: ${token.smart_degen_count||0} 🤖 | KOL: ${token.renowned_count||0} 👑\n`+
     `📢 DEX: ${getDexPromo(token)}\n`+
-    `🌐 ${getSocials(token)}\n\n`+
+    `🌐 ${getSocials(token)}\n`+
+    `${devQualityStr}\n`+
     `⚡ Buy before Raydium migration!\n💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump");
@@ -817,6 +841,7 @@ async function sendUltraAlert(token,ai) {
   const bar="█".repeat(Math.floor(progress/10))+"░".repeat(10-Math.floor(progress/10));
   const momentum=token.buyRatio>=10?"🔥🔥🔥 INSANE":token.buyRatio>=5?"🔥🔥 VERY HIGH":"🔥 HIGH";
   const riskEmoji=ai.risk==="LOW"?"🟢":ai.risk==="MEDIUM"?"🟡":"🔴";
+  const devQualityStr = token._devQuality ? `🧑‍💻 ${fmtDevQuality(token._devQuality)}\n` : "";
   const msg=
     `🚀 *ULTRA EARLY LAUNCH* — ${momentum}\n`+
     `AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n\n`+
@@ -830,7 +855,8 @@ async function sendUltraAlert(token,ai) {
     `📊 Price: ${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"} | MC: ${fmt(token.market_cap||0)}\n`+
     `Smart: ${token.smart_degen_count||0} 🤖 | Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
     `📢 DEX: ${getDexPromo(token)}\n`+
-    `🌐 ${getSocials(token)}\n\n`+
+    `🌐 ${getSocials(token)}\n`+
+    `${devQualityStr}\n`+
     `💰 *Snipe 0.1 SOL?* — Always DYOR`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra");
@@ -863,7 +889,6 @@ async function scan() {
     ...pumpTokens.map(t=>({...t,_type:"pump"})),
   ];
 
-  // Apply original v12 hardFilter to KOL only
   const filtered=allTokens.filter(t=>t._type==="ultra"||t._type==="pump"||hardFilter(t));
   log(`After hardFilter: ${filtered.length}`);
 
@@ -879,17 +904,24 @@ async function scan() {
     const mint=token.address;
     if (globalAlerted.has(mint)) continue;
     if (alerted.has(mint)&&Date.now()-alerted.get(mint)<ALERT_COOLDOWN_MS) continue;
-    // Creator rug check
+
+    // Creator rug check (pump.fun)
     const creator = token.creator || token.creator_address || "";
     if (creator && blacklistedCreators.has(creator)) { log(`Blocked blacklisted creator: ${creator.slice(0,8)}`); continue; }
     if (creator) {
       await fetchCreatorProfile(creator);
       if (blacklistedCreators.has(creator)) { log(`Blocked after check: ${creator.slice(0,8)}`); continue; }
+      // NEW: GMGN dev wallet quality check (extra info, no blocking)
+      token._devQuality = await fetchDevWalletQuality(creator);
+      token._devBestATH = token._devQuality.bestATH || 0;
     }
 
     // Copycat detection — warn only, never block
     const copycats = await checkCopycat(token.name||"", token.symbol||"", mint);
     if (copycats > 0) token._copycatWarning = `⚠️ ${copycats+1} tokens named $${token.symbol||"?"}`;
+
+    // Recalculate score with dev quality bonus
+    token._score = calcFinalScore(token, token._ai.confidence, Object.keys(insiderBuys[mint]||{}).length);
 
     globalAlerted.add(mint);alerted.set(mint,Date.now());
     try {
@@ -909,19 +941,20 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v3 — Supabase signal tracking");
+  log("⚡ Apex v4 — GMGN dev wallet ATH check added");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v3 Online*\n\n`+
+    `⚡ *Apex v4 Online*\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 3 Signals: KOL + Pump + Ultra Early\n`+
     `🤖 AI: OpenRouter Llama 3.3 70B (200/day)\n`+
     `🌐 Social warnings on all alerts\n`+
     `💾 Supabase signal tracking enabled\n`+
     `👤 Creator rug rate check\n`+
+    `🧑‍💻 NEW: Dev wallet ATH quality check\n`+
     `🔍 Copycat detection\n`+
     `👛 6 Insider wallets tracked\n`+
     `📊 2x/5x/10x milestone alerts\n\n`+
