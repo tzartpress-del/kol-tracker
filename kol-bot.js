@@ -55,7 +55,8 @@ let aiCallsToday         = 0;
 let aiResetTime          = Date.now() + 86400000;
 const blacklistedCreators = new Set();
 const creatorCache        = new Map();
-const devWalletCache      = new Map(); // NEW: GMGN dev wallet ATH cache
+const devWalletCache      = new Map(); // GMGN dev wallet ATH cache
+const trustedDevs         = new Map(); // wallet -> {best_x, symbol} — 10x+ proven devs
 
 const botStats = {
   kol:   { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
@@ -145,9 +146,11 @@ function calcFinalScore(token, aiConf, insiderCount) {
   s += Math.floor((aiConf||50)/20);
   if (getVelocity(token)>=1.5) s+=1;
   s += insiderCount;
-  // NEW: dev wallet quality bonus — proven dev with high ATH
+  // dev wallet quality bonus — proven dev with high ATH
   if (token._devBestATH >= 1000000) s+=2;      // dev made a 1M+ token before
   else if (token._devBestATH >= 100000) s+=1;  // dev made a 100K+ token before
+  // TRUSTED 10x DEV bonus — biggest signal
+  if (token._isTrustedDev) s+=5;
   return s;
 }
 
@@ -216,6 +219,47 @@ async function dbUpdate(table, match, data) {
   } catch(e) {
     log(`Supabase update error: ${e.message}`);
   }
+}
+
+// ─── TRUSTED DEVS (10x+ proven) ──────────────────────────────────────────────
+async function loadTrustedDevs() {
+  try {
+    const res = await axios.get(
+      `${SUPABASE_URL}/rest/v1/trusted_devs?select=*`,
+      { headers:{ "apikey":SUPABASE_KEY, "Authorization":`Bearer ${SUPABASE_KEY}` }, timeout:8000 }
+    );
+    if (Array.isArray(res.data)) {
+      for (const d of res.data) {
+        trustedDevs.set(d.dev_wallet, { best_x:d.best_x, symbol:d.token_symbol });
+      }
+      log(`Loaded ${trustedDevs.size} trusted 10x devs from Supabase`);
+    }
+  } catch(e) { log(`loadTrustedDevs error: ${e.message}`); }
+}
+
+async function addTrustedDev(wallet, bestX, symbol, mint) {
+  if (!wallet || trustedDevs.has(wallet)) return;
+  trustedDevs.set(wallet, { best_x:bestX, symbol });
+  log(`🌟 NEW TRUSTED DEV: ${wallet.slice(0,8)} made ${bestX.toFixed(1)}x with $${symbol}`);
+  // Upsert to Supabase
+  try {
+    await axios.post(
+      `${SUPABASE_URL}/rest/v1/trusted_devs`,
+      { dev_wallet:wallet, best_x:bestX, token_symbol:symbol, token_mint:mint },
+      { headers:{
+          "apikey":SUPABASE_KEY, "Authorization":`Bearer ${SUPABASE_KEY}`,
+          "Content-Type":"application/json", "Prefer":"resolution=merge-duplicates"
+        }, timeout:8000 }
+    );
+  } catch(e) { log(`addTrustedDev error: ${e.message}`); }
+  // Announce in Telegram
+  await bot.sendMessage(CHAT_ID,
+    `🌟 *NEW TRUSTED DEV ADDED*\n\n`+
+    `Dev made *${bestX.toFixed(1)}x* with $${symbol}\n`+
+    `\`${wallet}\`\n\n`+
+    `Future tokens from this dev get priority! 🚀`,
+    { parse_mode:"Markdown" }
+  ).catch(()=>{});
 }
 
 // ─── CREATOR RUG CHECK (pump.fun) ────────────────────────────────────────────
@@ -412,8 +456,8 @@ async function getTokenPrice(mint) {
   } catch(e) { return null; }
 }
 
-async function trackPerformance(mint,alertPrice,alertMC,symbol,alertMsgId,signalType) {
-  performanceTracker.set(mint,{alertPrice,alertMC,symbol,alertTime:Date.now(),alertMsgId,signalType,peakX:1,notified2x:false,notified5x:false,notified10x:false,notifiedDistrib:false});
+async function trackPerformance(mint,alertPrice,alertMC,symbol,alertMsgId,signalType,devWallet) {
+  performanceTracker.set(mint,{alertPrice,alertMC,symbol,alertTime:Date.now(),alertMsgId,signalType,devWallet,peakX:1,notified2x:false,notified5x:false,notified10x:false,notifiedDistrib:false});
   const interval=setInterval(async()=>{
     const tracker=performanceTracker.get(mint);
     if (!tracker){clearInterval(interval);return;}
@@ -425,7 +469,10 @@ async function trackPerformance(mint,alertPrice,alertMC,symbol,alertMsgId,signal
         peak_x: tracker.peakX,
         result: v.replace(/[^a-zA-Z0-9 ]/g,"").trim(),
         alert_price: tracker.alertPrice,
+        dev_wallet: tracker.devWallet || null,
       }).catch(()=>{});
+      // Also catch 10x that happened between checks
+      if (tracker.peakX >= 10 && tracker.devWallet) addTrustedDev(tracker.devWallet, tracker.peakX, symbol, mint).catch(()=>{});
       performanceTracker.delete(mint);clearInterval(interval);return;
     }
     const cur=await getTokenPrice(mint);
@@ -437,7 +484,10 @@ async function trackPerformance(mint,alertPrice,alertMC,symbol,alertMsgId,signal
       tracker.notifiedDistrib=true;
       await bot.sendMessage(CHAT_ID,`⚠️ *DISTRIBUTION* $${symbol} — sell pressure! ${x.toFixed(2)}x\n🚨 Consider exiting!`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});
     }
-    if (x>=10&&!tracker.notified10x){tracker.notified10x=true;stats.hits10x++;await bot.sendMessage(CHAT_ID,`🌙🌙🌙 *10x!* $${symbol} up *${x.toFixed(2)}x*!\n🏆 Take profit!`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});}
+    if (x>=10&&!tracker.notified10x){tracker.notified10x=true;stats.hits10x++;await bot.sendMessage(CHAT_ID,`🌙🌙🌙 *10x!* $${symbol} up *${x.toFixed(2)}x*!\n🏆 Take profit!`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});
+      // Add dev to trusted list — proven 10x maker
+      if (tracker.devWallet) addTrustedDev(tracker.devWallet, x, symbol, mint).catch(()=>{});
+    }
     else if (x>=5&&!tracker.notified5x){tracker.notified5x=true;stats.hits5x++;await bot.sendMessage(CHAT_ID,`🚀🚀 *5x!* $${symbol} up *${x.toFixed(2)}x*!`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});}
     else if (x>=2&&!tracker.notified2x){tracker.notified2x=true;stats.hits2x++;await bot.sendMessage(CHAT_ID,`✅ *2x!* $${symbol} up *${x.toFixed(2)}x*!`,{parse_mode:"Markdown",reply_to_message_id:alertMsgId}).catch(()=>{});}
     if (cur.liquidity<2000&&tracker.peakX>1.5){
@@ -760,8 +810,10 @@ async function sendKOLAlert(token,ai) {
   const change1h=token.price_change_percent1h||0;
   const insiderStr=insiders.length>0?`\n└ 👛 ${insiders.join(", ")}`:"";
   const devQualityStr = token._devQuality ? `\n└ 🧑‍💻 ${fmtDevQuality(token._devQuality)}` : "";
+  const trustedBadge = token._isTrustedDev ? `🌟 *TRUSTED 10x DEV* (made ${(token._trustedDevInfo?.best_x||0).toFixed(1)}x before!)\n` : "";
   const msg=
     `${isReentry?"🔄 *RE-ENTRY SIGNAL*":"🚨 *KOL SIGNAL*"} — ${signalLabel(score)}\n`+
+    `${trustedBadge}`+
     `Score: ${score} | AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n`+
     `${token._copycatWarning?token._copycatWarning+"\n":""}\n`+
     `*$${sym}*\n\`${mint}\`\n`+
@@ -784,7 +836,7 @@ async function sendKOLAlert(token,ai) {
     `└ 🌐 ${getSocials(token)}${devQualityStr}\n\n`+
     `💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,false)});
-  if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol");
+  if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol",token.creator||token.creator_address||"");
   botStats.kol.alerts++;
   log(`KOL: $${sym} score:${score} smart:${token.smart_degen_count||0} kol:${token.renowned_count||0}`);
   dbInsert("signals", {
@@ -796,6 +848,7 @@ async function sendKOLAlert(token,ai) {
     ai_decision: ai.decision,
     ai_confidence: ai.confidence || 0,
     has_socials: !!(token.twitter||token.telegram||token.website),
+    dev_wallet: token.creator || token.creator_address || null,
   }).catch(()=>{});
 }
 
@@ -806,8 +859,10 @@ async function sendPumpAlert(token,ai) {
   const urgency=progress>=90?"🔴 MIGRATING SOON":progress>=75?"🟡 FILLING FAST":"🟢 EARLY";
   const riskEmoji=ai.risk==="LOW"?"🟢":ai.risk==="MEDIUM"?"🟡":"🔴";
   const devQualityStr = token._devQuality ? `🧑‍💻 ${fmtDevQuality(token._devQuality)}\n` : "";
+  const trustedBadge = token._isTrustedDev ? `🌟 *TRUSTED 10x DEV* (made ${(token._trustedDevInfo?.best_x||0).toFixed(1)}x before!)\n` : "";
   const msg=
     `🎯 *PUMPFUN PRE-BOND* — ${urgency}\n`+
+    `${trustedBadge}`+
     `AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n\n`+
     `*$${sym}*\n\`${mint}\`\n`+
     `└ ⏱ ${fmtAge(token.open_timestamp?token.open_timestamp*1000:null)} | 👁 ${token.holder_count||"N/A"} holders\n\n`+
@@ -819,7 +874,7 @@ async function sendPumpAlert(token,ai) {
     `${devQualityStr}\n`+
     `⚡ Buy before Raydium migration!\n💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
-  if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump");
+  if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump",token.creator||token.creator_address||"");
   botStats.pump.alerts++;
   log(`Pump: $${sym} ${progress.toFixed(0)}%`);
   dbInsert("signals", {
@@ -831,6 +886,7 @@ async function sendPumpAlert(token,ai) {
     ai_decision: ai.decision,
     ai_confidence: ai.confidence || 0,
     has_socials: !!(token.twitter||token.telegram||token.website),
+    dev_wallet: token.creator || token.creator_address || null,
   }).catch(()=>{});
 }
 
@@ -842,8 +898,10 @@ async function sendUltraAlert(token,ai) {
   const momentum=token.buyRatio>=10?"🔥🔥🔥 INSANE":token.buyRatio>=5?"🔥🔥 VERY HIGH":"🔥 HIGH";
   const riskEmoji=ai.risk==="LOW"?"🟢":ai.risk==="MEDIUM"?"🟡":"🔴";
   const devQualityStr = token._devQuality ? `🧑‍💻 ${fmtDevQuality(token._devQuality)}\n` : "";
+  const trustedBadge = token._isTrustedDev ? `🌟 *TRUSTED 10x DEV* (made ${(token._trustedDevInfo?.best_x||0).toFixed(1)}x before!)\n` : "";
   const msg=
     `🚀 *ULTRA EARLY LAUNCH* — ${momentum}\n`+
+    `${trustedBadge}`+
     `AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n\n`+
     `*$${sym}*\n\`${mint}\`\n`+
     `└ ⏱ ${ageMin}m | 👁 ${token.holder_count||"N/A"} holders\n\n`+
@@ -859,7 +917,7 @@ async function sendUltraAlert(token,ai) {
     `${devQualityStr}\n`+
     `💰 *Snipe 0.1 SOL?* — Always DYOR`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
-  if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra");
+  if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra",token.creator||token.creator_address||"");
   botStats.ultra.alerts++;
   log(`Ultra: $${sym} age:${ageMin}m ratio:${token.buyRatio?.toFixed(1)}`);
   dbInsert("signals", {
@@ -871,6 +929,7 @@ async function sendUltraAlert(token,ai) {
     ai_decision: ai.decision,
     ai_confidence: ai.confidence || 0,
     has_socials: !!(token.twitter||token.telegram||token.website),
+    dev_wallet: token.creator || token.creator_address || null,
   }).catch(()=>{});
 }
 
@@ -911,9 +970,14 @@ async function scan() {
     if (creator) {
       await fetchCreatorProfile(creator);
       if (blacklistedCreators.has(creator)) { log(`Blocked after check: ${creator.slice(0,8)}`); continue; }
-      // NEW: GMGN dev wallet quality check (extra info, no blocking)
+      // GMGN dev wallet quality check (extra info, no blocking)
       token._devQuality = await fetchDevWalletQuality(creator);
       token._devBestATH = token._devQuality.bestATH || 0;
+      // Check if this is a TRUSTED 10x dev
+      if (trustedDevs.has(creator)) {
+        token._isTrustedDev = true;
+        token._trustedDevInfo = trustedDevs.get(creator);
+      }
     }
 
     // Copycat detection — warn only, never block
@@ -941,20 +1005,24 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v4 — GMGN dev wallet ATH check added");
+  log("⚡ Apex v5 — Trusted 10x dev auto-tracking");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
 
+  // Load trusted devs from Supabase (survives restarts)
+  await loadTrustedDevs();
+
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v4 Online*\n\n`+
+    `⚡ *Apex v5 Online*\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 3 Signals: KOL + Pump + Ultra Early\n`+
     `🤖 AI: OpenRouter Llama 3.3 70B (200/day)\n`+
     `🌐 Social warnings on all alerts\n`+
     `💾 Supabase signal tracking enabled\n`+
     `👤 Creator rug rate check\n`+
-    `🧑‍💻 NEW: Dev wallet ATH quality check\n`+
+    `🧑‍💻 Dev wallet ATH quality check\n`+
+    `🌟 NEW: Auto-track 10x devs (priority alerts)\n`+
     `🔍 Copycat detection\n`+
     `👛 6 Insider wallets tracked\n`+
     `📊 2x/5x/10x milestone alerts\n\n`+
