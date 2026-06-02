@@ -37,6 +37,13 @@ const ULTRA_MIN_VOLUME    = 3000;
 const ULTRA_MIN_HOLDERS   = 30;
 const ULTRA_MIN_BUY_RATIO = 2;
 
+// KOL Early (NEW v6) — catch brand-new tokens 2+ KOLs already bought, at low MC
+const KOLE_MIN_RENOWNED   = 2;       // require 2+ KOL buyers
+const KOLE_MAX_MC         = 100000;  // under $100K (catch early)
+const KOLE_MAX_AGE_MS     = 60 * 60 * 1000; // within 1 hour of creation
+const KOLE_MAX_BUNDLE     = 0.4;
+const KOLE_MAX_RUG        = 0.3;
+
 const OPENROUTER_MODEL    = "meta-llama/llama-3.3-70b-instruct:free";
 const AI_DAILY_LIMIT      = 200;
 const AI_CACHE_TTL        = 1800000;
@@ -62,6 +69,7 @@ const botStats = {
   kol:   { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
   pump:  { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
   ultra: { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
+  kolEarly: { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
 };
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
@@ -755,6 +763,64 @@ function processUltraList(list, seen, results) {
   }
 }
 
+// ─── KOL EARLY SIGNALS (NEW v6) ──────────────────────────────────────────────
+// Catches brand-new tokens (from trenches new_creation) that 2+ KOLs already
+// bought, at low MC — BEFORE they trend. This is the "catch it at $8K" signal.
+async function getKOLEarlySignals() {
+  const seen=new Set(), results=[];
+  // Pull fresh launches from trenches new_creation (same source as Ultra)
+  const body=buildTrenchesBody(["new_creation"]);
+  const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",body},"POST");
+  if (data) processKOLEarlyList(data?.data?.new_creation||[],seen,results);
+  // Also try public new tokens as fallback
+  if (results.length===0) {
+    const pub=await fetchPublic(`https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/5m?orderby=open_timestamp&direction=desc&filters[]=not_honeypot&limit=100`);
+    const list=pub?.data?.rank||pub?.data?.token_list||[];
+    if (Array.isArray(list)&&list.length>0) processKOLEarlyList(list,seen,results);
+  }
+  // Sort by KOL count (most KOLs first), then smart money
+  return results.sort((a,b)=>{
+    const kolDiff=(b.renowned_count||0)-(a.renowned_count||0);
+    if (kolDiff!==0) return kolDiff;
+    return (b.smart_degen_count||0)-(a.smart_degen_count||0);
+  }).slice(0,5);
+}
+
+function processKOLEarlyList(list, seen, results) {
+  for (const t of list) {
+    if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
+    seen.add(t.address);
+    const ageMs   = t.created_timestamp?(Date.now()-t.created_timestamp*1000)
+                  : t.open_timestamp?(Date.now()-t.open_timestamp*1000):null;
+    if (!ageMs||ageMs>KOLE_MAX_AGE_MS) continue; // must be fresh
+    const mc       = t.usd_market_cap||t.market_cap||0;
+    const kol      = t.renowned_count||0;
+    const smart    = t.smart_degen_count||0;
+    const rug      = t.rug_ratio||0;
+    const bundle   = t.bundler_trader_amount_rate||0;
+    const wash     = t.is_wash_trading||false;
+    const honeypot = t.is_honeypot||false;
+    const top10    = t.top_10_holder_rate||0;
+    const progress = t.launchpad_status?.bonding_curve_percentage||t.progress||0;
+    const volume   = t.volume_1h||t.volume_24h||t.volume||0;
+    const holders  = t.holder_count||0;
+    const buys     = t.buys_24h||t.buys||0;
+    const sells    = t.sells_24h||t.sells||0;
+    const buyRatio = sells>0?buys/sells:buys>0?buys:0;
+    // The key filter: 2+ KOLs bought a fresh, cheap token
+    if (
+      kol      >= KOLE_MIN_RENOWNED &&  // 2+ KOL buyers — the core signal
+      mc       <= KOLE_MAX_MC       &&  // still cheap (under 100K)
+      mc       >  0                 &&
+      rug      <  KOLE_MAX_RUG      &&
+      bundle   <  KOLE_MAX_BUNDLE   &&
+      top10    <  0.6               &&
+      !wash                         &&
+      !honeypot
+    ) results.push({...t,alertType:"KOL_EARLY",_ageMs:ageMs,progress,buys,sells,buyRatio,market_cap:mc,volume});
+  }
+}
+
 // ─── SOCIALS HELPER ──────────────────────────────────────────────────────────
 function getSocials(token) {
   const parts = [];
@@ -933,22 +999,68 @@ async function sendUltraAlert(token,ai) {
   }).catch(()=>{});
 }
 
+// ─── KOL EARLY ALERT (NEW v6) ────────────────────────────────────────────────
+async function sendKOLEarlyAlert(token,ai) {
+  const mint=token.address, sym=token.symbol||"???";
+  const ageMin=Math.floor((token._ageMs||0)/60000);
+  const kol=token.renowned_count||0;
+  const smart=token.smart_degen_count||0;
+  const riskEmoji=ai.risk==="LOW"?"🟢":ai.risk==="MEDIUM"?"🟡":"🔴";
+  const trustedBadge = token._isTrustedDev ? `🌟 *TRUSTED 10x DEV* (made ${(token._trustedDevInfo?.best_x||0).toFixed(1)}x before!)\n` : "";
+  const devQualityStr = token._devQuality ? `🧑‍💻 ${fmtDevQuality(token._devQuality)}\n` : "";
+  const msg=
+    `👑 *KOL EARLY ENTRY* — ${kol} KOLs IN EARLY!\n`+
+    `${trustedBadge}`+
+    `AI: ${riskEmoji} ${ai.risk} ${ai.confidence}%\n`+
+    `${token._copycatWarning?token._copycatWarning+"\n":""}\n`+
+    `*$${sym}*\n\`${mint}\`\n`+
+    `└ ⏱ ${ageMin}m old | 👁 ${token.holder_count||"N/A"} holders\n\n`+
+    `🔥 *Why this matters*\n`+
+    `├ ${kol} KOL buyers 👑 (2+ = strong)\n`+
+    `├ ${smart} smart money 🤖\n`+
+    `└ Caught EARLY at low MC\n\n`+
+    `📊 *Token Details*\n`+
+    `├ Price: ${token.price?`$${parseFloat(token.price).toExponential(4)}`:"N/A"}\n`+
+    `├ MC:    ${fmt(token.market_cap||0)}\n`+
+    `├ Vol:   ${fmt(token.volume||0)}\n`+
+    `└ Rug:   ${((token.rug_ratio||0)*100).toFixed(0)}%\n\n`+
+    `🌐 ${getSocials(token)}\n`+
+    `${devQualityStr}\n`+
+    `💰 *Snipe early — higher risk, higher reward*`;
+  const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
+  if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kolEarly",token.creator||token.creator_address||"");
+  botStats.kolEarly.alerts++;
+  log(`KOL EARLY: $${sym} kol:${kol} smart:${smart} mc:${fmt(token.market_cap||0)}`);
+  dbInsert("signals", {
+    mint, symbol:sym, signal_type:"KOL_EARLY",
+    alert_price: token.price ? parseFloat(token.price) : null,
+    alert_mc: token.market_cap || null,
+    smart_degen_count: token.smart_degen_count || 0,
+    rug_ratio: token.rug_ratio || 0,
+    ai_decision: ai.decision,
+    ai_confidence: ai.confidence || 0,
+    has_socials: !!(token.twitter||token.telegram||token.website),
+    dev_wallet: token.creator || token.creator_address || null,
+  }).catch(()=>{});
+}
+
 // ─── MAIN SCAN ────────────────────────────────────────────────────────────────
 async function scan() {
   log("Scanning...");
   pollInsiderWallets().catch(()=>{});
-  const [kolTokens,pumpTokens,ultraTokens]=await Promise.all([
-    getKOLSignals(), getPumpSignals(), getUltraSignals()
+  const [kolTokens,pumpTokens,ultraTokens,kolEarlyTokens]=await Promise.all([
+    getKOLSignals(), getPumpSignals(), getUltraSignals(), getKOLEarlySignals()
   ]);
-  log(`KOL:${kolTokens.length} Pump:${pumpTokens.length} Ultra:${ultraTokens.length}`);
+  log(`KOL:${kolTokens.length} Pump:${pumpTokens.length} Ultra:${ultraTokens.length} KOLEarly:${kolEarlyTokens.length}`);
 
   const allTokens=[
+    ...kolEarlyTokens.map(t=>({...t,_type:"kolEarly"})),
     ...ultraTokens.map(t=>({...t,_type:"ultra"})),
     ...kolTokens.map(t=>({...t,_type:"kol"})),
     ...pumpTokens.map(t=>({...t,_type:"pump"})),
   ];
 
-  const filtered=allTokens.filter(t=>t._type==="ultra"||t._type==="pump"||hardFilter(t));
+  const filtered=allTokens.filter(t=>t._type==="ultra"||t._type==="pump"||t._type==="kolEarly"||hardFilter(t));
   log(`After hardFilter: ${filtered.length}`);
 
   const aiResults=await Promise.all(filtered.map(t=>claudeFilter(t)));
@@ -989,7 +1101,8 @@ async function scan() {
 
     globalAlerted.add(mint);alerted.set(mint,Date.now());
     try {
-      if (token._type==="ultra") await sendUltraAlert(token,token._ai);
+      if (token._type==="kolEarly") await sendKOLEarlyAlert(token,token._ai);
+      else if (token._type==="ultra") await sendUltraAlert(token,token._ai);
       else if (token._type==="pump") await sendPumpAlert(token,token._ai);
       else await sendKOLAlert(token,token._ai);
       sent++;
@@ -1005,7 +1118,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v5 — Trusted 10x dev auto-tracking");
+  log("⚡ Apex v6 — KOL Early signal added");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1014,15 +1127,16 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v5 Online*\n\n`+
+    `⚡ *Apex v6 Online*\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
-    `🎯 3 Signals: KOL + Pump + Ultra Early\n`+
+    `🎯 4 Signals: KOL + Pump + Ultra + 👑 KOL Early\n`+
+    `👑 NEW: KOL Early — 2+ KOLs in fresh tokens <$100K\n`+
     `🤖 AI: OpenRouter Llama 3.3 70B (200/day)\n`+
     `🌐 Social warnings on all alerts\n`+
     `💾 Supabase signal tracking enabled\n`+
     `👤 Creator rug rate check\n`+
     `🧑‍💻 Dev wallet ATH quality check\n`+
-    `🌟 NEW: Auto-track 10x devs (priority alerts)\n`+
+    `🌟 Auto-track 10x devs (priority alerts)\n`+
     `🔍 Copycat detection\n`+
     `👛 6 Insider wallets tracked\n`+
     `📊 2x/5x/10x milestone alerts\n\n`+
