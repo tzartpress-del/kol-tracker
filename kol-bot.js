@@ -2,6 +2,8 @@ const TelegramBot = require("node-telegram-bot-api");
 const axios = require("axios");
 const https = require("https");
 const dns = require("dns");
+const crypto = require("crypto");
+const express = require("express");
 const { v4: uuidv4 } = require("uuid");
 
 process.on("unhandledRejection", console.error);
@@ -16,6 +18,10 @@ const HELIUS_API_KEY = process.env.HELIUS_API_KEY;
 const GMGN_API_KEY   = process.env.GMGN_API_KEY;
 const SUPABASE_URL   = process.env.SUPABASE_URL || "https://ksulmvlrmwpalgqzlxjt.supabase.co";
 const SUPABASE_KEY   = process.env.SUPABASE_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtzdWxtdmxybXdwYWxncXpseGp0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk3MzQ0NzAsImV4cCI6MjA5NTMxMDQ3MH0.lbVBCzcYrpbGp5J-m1Xz33sTf7k799A8md0pWIJfXYw";
+
+// ─── WEBHOOK CONFIG ──────────────────────────────────────────────────────────
+const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || "bcbf41cc-88ad-4f45-8e41-2ac7043f4f4c";
+const WEBHOOK_PORT   = parseInt(process.env.PORT) || 3000;
 
 // ─── ORIGINAL V12 FILTERS ────────────────────────────────────────────────────
 const MC_MIN              = 15000;
@@ -436,29 +442,200 @@ const INSIDER_WALLETS = {
   "BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB": "Axio_TTSk",
 };
 
-async function pollInsiderWallets() {
-  if (!HELIUS_API_KEY) return;
-  for (const [wallet,name] of Object.entries(INSIDER_WALLETS)) {
+// ─── WEBHOOK SERVER (replaces pollInsiderWallets interval) ───────────────────
+// Helius POSTs swap events in real-time to /webhook
+// Much faster than polling — fires the instant an insider wallet swaps
+function startWebhookServer() {
+  const app = express();
+
+  // Parse raw body for signature verification
+  app.use(express.json({
+    verify: (req, res, buf) => { req.rawBody = buf; }
+  }));
+
+  app.get("/health", (req, res) => res.json({ status: "ok", uptime: process.uptime() }));
+
+  app.post("/webhook", (req, res) => {
     try {
-      const res=await axios.get(`https://api.helius.xyz/v0/addresses/${wallet}/transactions?api-key=${HELIUS_API_KEY}&limit=5&type=SWAP`,{timeout:8000});
-      const txs=res.data||[];
-      if (!txs.length) continue;
-      const newTxs=lastSig[wallet]?txs.filter(t=>t.signature!==lastSig[wallet]):txs.slice(0,2);
-      if (newTxs.length) lastSig[wallet]=txs[0].signature;
-      for (const tx of newTxs) {
-        const WSOL="So11111111111111111111111111111111111111112";
-        const recv=(tx.tokenTransfers||[]).find(t=>t.toUserAccount===wallet&&t.mint!==WSOL);
-        if (!recv?.mint) continue;
-        if (!insiderBuys[recv.mint]) insiderBuys[recv.mint]={};
-        insiderBuys[recv.mint][name]=Date.now();
-        log(`Insider ${name} bought ${recv.mint.slice(0,8)}`);
+      // Optional: verify Helius signature if secret is set
+      if (WEBHOOK_SECRET) {
+        const sig = req.headers["authorization"] || req.headers["x-helius-signature"] || "";
+        if (sig && sig !== WEBHOOK_SECRET) {
+          log(`[Webhook] Invalid signature — rejected`);
+          return res.status(401).json({ error: "unauthorized" });
+        }
       }
-    } catch(e) {}
-    await new Promise(r=>setTimeout(r,500));
+
+      res.status(200).json({ ok: true }); // Acknowledge immediately
+
+      const events = Array.isArray(req.body) ? req.body : [req.body];
+      for (const event of events) {
+        processWebhookEvent(event).catch(e => log(`[Webhook] processEvent error: ${e.message}`));
+      }
+    } catch(e) {
+      log(`[Webhook] handler error: ${e.message}`);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.listen(WEBHOOK_PORT, () => {
+    log(`[Webhook] Server listening on port ${WEBHOOK_PORT}`);
+  });
+}
+
+async function processWebhookEvent(event) {
+  const WSOL = "So11111111111111111111111111111111111111112";
+
+  // Helius enhanced transaction format
+  const txType   = event.type || event.transactionType || "";
+  const accounts = event.accountData || [];
+  const transfers = event.tokenTransfers || [];
+  const feePayer  = event.feePayer || "";
+
+  // Find which insider wallet triggered this event
+  const walletName = INSIDER_WALLETS[feePayer];
+  if (!walletName) {
+    // feePayer might not be the wallet — check all involved accounts
+    const involved = accounts.map(a => a.account).filter(a => INSIDER_WALLETS[a]);
+    if (!involved.length) return;
+    // Process for each matched insider wallet
+    for (const wallet of involved) {
+      await processInsiderTransfers(wallet, INSIDER_WALLETS[wallet], transfers, WSOL);
+    }
+    return;
   }
-  const cutoff=Date.now()-7200000;
-  for (const [mint,buyers] of Object.entries(insiderBuys)) {
-    for (const [k,ts] of Object.entries(buyers)) { if (ts<cutoff) delete insiderBuys[mint][k]; }
+
+  await processInsiderTransfers(feePayer, walletName, transfers, WSOL);
+}
+
+async function processInsiderTransfers(wallet, name, transfers, WSOL) {
+  // Find tokens received by this wallet (buys)
+  const bought = transfers.filter(t =>
+    t.toUserAccount === wallet &&
+    t.mint !== WSOL &&
+    t.mint
+  );
+
+  for (const recv of bought) {
+    if (!insiderBuys[recv.mint]) insiderBuys[recv.mint] = {};
+    insiderBuys[recv.mint][name] = Date.now();
+    log(`[Webhook] ⚡ REAL-TIME: ${name} bought ${recv.mint.slice(0,8)}`);
+
+    // Notify Telegram immediately — faster than waiting for next scan
+    await bot.sendMessage(CHAT_ID,
+      `⚡ *Insider Buy Detected*
+
+` +
+      `👛 ${name}
+` +
+      `🪙 \`${recv.mint}\`
+` +
+      `💰 Amount: ${recv.tokenAmount ? recv.tokenAmount.toLocaleString() : "N/A"}
+
+` +
+      `_Bot will alert if this token qualifies in next scan_`,
+      { parse_mode: "Markdown" }
+    ).catch(() => {});
+  }
+
+  // Also track sells — useful context
+  const sold = transfers.filter(t =>
+    t.fromUserAccount === wallet &&
+    t.mint !== WSOL &&
+    t.mint
+  );
+  for (const send of sold) {
+    log(`[Webhook] 📤 ${name} sold/sent ${send.mint.slice(0,8)}`);
+    // Remove from insiderBuys if they fully exited
+    if (insiderBuys[send.mint]?.[name]) {
+      delete insiderBuys[send.mint][name];
+      log(`[Webhook] Removed ${name} buy for ${send.mint.slice(0,8)} (sold)`);
+    }
+  }
+}
+
+// ─── HELIUS DAS: KOL HOLDER VERIFICATION (Feature 5) ─────────────────────────
+// Before sending KOL/KOL Early alerts, verify KOL wallets still hold the token
+// Pulls holder list from GMGN, cross-checks balances via Helius DAS API
+async function verifyKOLsStillHolding(tokenMint, expectedKolCount) {
+  if (!HELIUS_API_KEY || expectedKolCount === 0) return { verified: false, stillHolding: 0, label: "" };
+  try {
+    // Step 1: Get token holders from GMGN
+    const holdersData = await fetchOpenAPI("/v1/token/holders", {
+      chain: "sol",
+      address: tokenMint,
+      limit: "50"
+    });
+    const holders = extractList(holdersData);
+    if (!holders.length) return { verified: false, stillHolding: 0, label: "⚠️ Holders N/A" };
+
+    // Step 2: Find wallets tagged as renowned/KOL/smart
+    const kolWallets = holders
+      .filter(h => h.is_renowned || h.is_smart_degen || h.tag === "kol" || h.wallet_tag === "kol")
+      .map(h => h.address || h.wallet)
+      .filter(Boolean)
+      .slice(0, 10); // cap at 10 to limit DAS calls
+
+    if (!kolWallets.length) return { verified: false, stillHolding: 0, label: "⚠️ KOL wallets not identified" };
+
+    // Step 3: Batch check balances via Helius DAS
+    const res = await axios.post(
+      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+      {
+        jsonrpc: "2.0",
+        id: "kol-check",
+        method: "getTokenAccountsByOwner",
+        params: [
+          kolWallets[0], // DAS getTokenAccountsByOwner is per-wallet
+          { mint: tokenMint },
+          { encoding: "jsonParsed" }
+        ]
+      },
+      { timeout: 8000 }
+    );
+
+    // For multiple wallets, check each sequentially (capped at 5)
+    let stillHolding = 0;
+    const walletsToCheck = kolWallets.slice(0, 5);
+    for (const wallet of walletsToCheck) {
+      try {
+        const r = await axios.post(
+          `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
+          {
+            jsonrpc: "2.0", id: "kol-bal",
+            method: "getTokenAccountsByOwner",
+            params: [wallet, { mint: tokenMint }, { encoding: "jsonParsed" }]
+          },
+          { timeout: 5000 }
+        );
+        const accounts = r.data?.result?.value || [];
+        const balance = accounts.reduce((sum, a) =>
+          sum + parseFloat(a.account?.data?.parsed?.info?.tokenAmount?.uiAmount || 0), 0);
+        if (balance > 0) stillHolding++;
+      } catch(e) {}
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    const pct = walletsToCheck.length > 0 ? Math.round((stillHolding / walletsToCheck.length) * 100) : 0;
+    let label;
+    if (stillHolding === 0)           label = `⚠️ KOLs may have exited (0/${walletsToCheck.length} holding)`;
+    else if (pct >= 80)               label = `✅ KOLs holding (${stillHolding}/${walletsToCheck.length} confirmed)`;
+    else                              label = `🟡 KOLs partial (${stillHolding}/${walletsToCheck.length} still in)`;
+
+    log(`[KOL Check] ${tokenMint.slice(0,8)}: ${stillHolding}/${walletsToCheck.length} KOLs still holding`);
+    return { verified: true, stillHolding, total: walletsToCheck.length, label };
+
+  } catch(e) {
+    log(`[KOL Check] error: ${e.message}`);
+    return { verified: false, stillHolding: 0, label: "" };
+  }
+}
+
+// Cleanup stale insider buys — still needed, runs periodically
+function cleanupInsiderBuys() {
+  const cutoff = Date.now() - 7200000;
+  for (const [mint, buyers] of Object.entries(insiderBuys)) {
+    for (const [k, ts] of Object.entries(buyers)) { if (ts < cutoff) delete insiderBuys[mint][k]; }
     if (!Object.keys(insiderBuys[mint]).length) delete insiderBuys[mint];
   }
 }
@@ -1104,6 +1281,9 @@ async function sendKOLAlert(token,ai) {
   const insiderStr=insiders.length>0?`\n└ 👛 ${insiders.join(", ")}`:"";
   const devQualityStr = token._devQuality ? `\n└ 🧑‍💻 ${fmtDevQuality(token._devQuality)}` : "";
   const trustedBadge = token._isTrustedDev ? `🌟 *TRUSTED 10x DEV* (made ${(token._trustedDevInfo?.best_x||0).toFixed(1)}x before!)\n` : "";
+  // Feature 5: verify KOLs still holding via Helius DAS
+  const kolCheck = await verifyKOLsStillHolding(mint, token.renowned_count||0);
+  const kolHoldStr = kolCheck.label ? `\n└ ${kolCheck.label}` : '';
   const msg=
     `${isReentry?"🔄 *RE-ENTRY SIGNAL*":"🚨 *KOL SIGNAL*"} — ${signalLabel(score)}\n`+
     `${trustedBadge}`+
@@ -1120,7 +1300,7 @@ async function sendKOLAlert(token,ai) {
     `└ Velocity: ${vel}x ${velocityLabel(vel)}\n\n`+
     `🧠 *Smart Signals*\n`+
     `├ Smart Money: ${token.smart_degen_count||0} 🤖\n`+
-    `├ KOL Holders: ${token.renowned_count||0} 👑\n`+
+    `├ KOL Holders: ${token.renowned_count||0} 👑${kolHoldStr}\n`+
     `└ Netflow: ${netflow}${insiderStr}\n\n`+
     `🔒 *Security*\n`+
     `├ Dev: ${devStatus} | Mint: ${token.renounced_mint===1?"🟢 Yes":"🔴 No"}\n`+
@@ -1233,6 +1413,9 @@ async function sendKOLEarlyAlert(token,ai) {
   const smart=token.smart_degen_count||0;
   const riskEmoji=ai.risk==="LOW"?"🟢":ai.risk==="MEDIUM"?"🟡":"🔴";
   const trustedBadge = token._isTrustedDev ? `🌟 *TRUSTED 10x DEV* (made ${(token._trustedDevInfo?.best_x||0).toFixed(1)}x before!)\n` : "";
+  // Feature 5: verify KOLs still holding
+  const kolCheck = await verifyKOLsStillHolding(mint, token.renowned_count||0);
+  const kolHoldStr = kolCheck.label ? `\n└ ${kolCheck.label}` : '';
   const devQualityStr = token._devQuality ? `🧑‍💻 ${fmtDevQuality(token._devQuality)}\n` : "";
   const msg=
     `👑 *KOL EARLY ENTRY* — ${kol} KOLs IN EARLY!\n`+
@@ -1242,7 +1425,7 @@ async function sendKOLEarlyAlert(token,ai) {
     `*$${sym}*\n\`${mint}\`\n`+
     `└ ⏱ ${ageMin}m old | 👁 ${token.holder_count||"N/A"} holders\n\n`+
     `🔥 *Why this matters*\n`+
-    `├ ${kol} KOL buyers 👑 (2+ = strong)\n`+
+    `├ ${kol} KOL buyers 👑 (2+ = strong)${kolHoldStr}\n`+
     `├ ${smart} smart money 🤖\n`+
     `└ Caught EARLY at low MC\n\n`+
     `📊 *Token Details*\n`+
@@ -1273,7 +1456,7 @@ async function sendKOLEarlyAlert(token,ai) {
 // ─── MAIN SCAN ────────────────────────────────────────────────────────────────
 async function scan() {
   log("Scanning...");
-  pollInsiderWallets().catch(()=>{});
+  cleanupInsiderBuys(); // webhook handles real-time detection; just clean stale buys here
   const [kolTokens,pumpTokens,ultraTokens,kolEarlyTokens]=await Promise.all([
     getKOLSignals(), getPumpSignals(), getUltraSignals(), getKOLEarlySignals()
   ]);
@@ -1339,7 +1522,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7.1 — Stable Gem hardened (frozen/age/BS/volume fixes)");
+  log("⚡ Apex v7.2 — Webhook insider tracking + Helius KOL verification");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1347,7 +1530,7 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7.1 Online*\n\n`+
+    `⚡ *Apex v7.2 Online*\n\n`+
     `🔧 Stable Gem hardened:\n`+
     `  • Frozen/blacklist tokens blocked\n`+
     `  • Max age 30 days (no corpse coins)\n`+
@@ -1371,6 +1554,9 @@ async function main() {
   );
 
   // Main signal scan — every 60 seconds (unchanged)
+  // Start webhook server — replaces polling, receives Helius push events
+  startWebhookServer();
+
   await scan();
   setInterval(scan, POLL_INTERVAL_MS);
 
