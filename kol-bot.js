@@ -55,6 +55,7 @@ const STABLE_GEM_PRICE_CHANGE_MAX = 50;    // not already mooning (24h change %)
 const STABLE_GEM_VOLUME_MIN       = 50_000;
 const STABLE_GEM_HOLDER_MIN       = 200;
 const STABLE_GEM_BUY_RATIO_MIN    = 1.2;   // buy volume > sell volume
+const STABLE_GEM_MAX_AGE_DAYS     = 30;    // ignore coins >30 days old (dead accumulation, not healthy)
 const STABLE_GEM_COOLDOWN_MS      = 24 * 60 * 60 * 1000; // don't re-alert same token for 24h
 
 const OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free";
@@ -884,11 +885,25 @@ async function runStableGemScan() {
       const wash       = t.is_wash_trading || false;
       const honeypot   = t.is_honeypot || false;
 
+      // FIX 1: Reject frozen/blacklist tokens — dev can freeze wallets = rug vector
+      const frozen      = t.is_freeze_authority || t.freeze_authority || t.token_frozen || false;
+      const blacklisted = t.is_blacklist || t.blacklist || false;
+      if (frozen || blacklisted) return false;
+
       if (mc < STABLE_GEM_MC_MIN || mc > STABLE_GEM_MC_MAX) return false;
       if (vol < STABLE_GEM_VOLUME_MIN)   return false;
       if (holders < STABLE_GEM_HOLDER_MIN) return false;
       if (wash || honeypot)              return false;
-      // Price change filter — must be in "stable" range (not dumping, not already pumping)
+
+      // FIX 2: Age cap — coin stable for >30 days at this MC is a corpse, not accumulation
+      const tokenAgeMs = t.open_timestamp ? (Date.now() - t.open_timestamp * 1000) : null;
+      if (tokenAgeMs && tokenAgeMs > STABLE_GEM_MAX_AGE_DAYS * 86400000) return false;
+
+      // FIX 4: Require recent activity — zero 1h volume = no live interest right now
+      const recentVol = t.volume_1h || t.volume_5m || 0;
+      if (recentVol === 0) return false;
+
+      // Price change filter — must be in "stable" range (not dumping, not already mooning)
       if (priceChg !== null) {
         if (priceChg < STABLE_GEM_PRICE_CHANGE_MIN) return false;
         if (priceChg > STABLE_GEM_PRICE_CHANGE_MAX) return false;
@@ -910,11 +925,11 @@ async function runStableGemScan() {
       if (volatility === null) continue;
       if (volatility > STABLE_GEM_VOLATILITY_MAX) continue;
 
-      // Buy/sell ratio check
+      // FIX 3: B/S ratio — fail CLOSED when null (can't confirm accumulation = skip)
       const buyVol  = token.buy_volume_24h  || token.buy_volume  || 0;
       const sellVol = token.sell_volume_24h || token.sell_volume || 0;
       const buySellRatio = sellVol > 0 ? buyVol / sellVol : buyVol > 0 ? 2 : null;
-      if (buySellRatio !== null && buySellRatio < STABLE_GEM_BUY_RATIO_MIN) continue;
+      if (!buySellRatio || buySellRatio < STABLE_GEM_BUY_RATIO_MIN) continue;
 
       gems.push({ token, volatility, buySellRatio });
       log(`[StableGem] ✅ ${token.symbol} MC:${fmt(token.market_cap)} vol:${(volatility*100).toFixed(1)}%`);
@@ -1324,7 +1339,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7 — Stable Gem signal added");
+  log("⚡ Apex v7.1 — Stable Gem hardened (frozen/age/BS/volume fixes)");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1332,7 +1347,12 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7 Online*\n\n`+
+    `⚡ *Apex v7.1 Online*\n\n`+
+    `🔧 Stable Gem hardened:\n`+
+    `  • Frozen/blacklist tokens blocked\n`+
+    `  • Max age 30 days (no corpse coins)\n`+
+    `  • B/S ratio fail-closed (N/A = reject)\n`+
+    `  • Requires live 1h volume\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 5 Signals: KOL + Pump + Ultra + 👑 KOL Early + 📊 Stable Gem\n`+
     `📊 NEW: Stable Gem — $500K–$1M MC, stable 24h+, accumulation zone\n`+
