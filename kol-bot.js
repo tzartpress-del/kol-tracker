@@ -26,7 +26,7 @@ const WEBHOOK_PORT   = parseInt(process.env.PORT) || 3000;
 // ─── ORIGINAL V12 FILTERS ────────────────────────────────────────────────────
 const MC_MIN              = 15000;
 const MC_MAX              = 150000;
-const POLL_INTERVAL_MS    = 60000;
+const POLL_INTERVAL_MS    = 20000; // POLLING TEST: 20s (was 60s)
 const ALERT_COOLDOWN_MS   = 3600000;
 const MAX_TOKEN_AGE_MS    = 24 * 60 * 60 * 1000;
 const REENTRY_MIN_VOLUME  = 50000;
@@ -50,19 +50,29 @@ const KOLE_MAX_AGE_MS     = 60 * 60 * 1000;
 const KOLE_MAX_BUNDLE     = 0.4;
 const KOLE_MAX_RUG        = 0.3;
 
-// ─── STABLE GEM CONFIG (NEW v7) ───────────────────────────────────────────────
-// Scans every 10 min for $500K–$1M MC coins stable 24h+ with accumulation signs
-const STABLE_GEM_INTERVAL_MS      = 10 * 60 * 1000; // 10 minutes
+// ─── STABLE GEM CONFIG (v7) ───────────────────────────────────────────────────
+const STABLE_GEM_INTERVAL_MS      = 10 * 60 * 1000;
 const STABLE_GEM_MC_MIN           = 500_000;
 const STABLE_GEM_MC_MAX           = 1_000_000;
-const STABLE_GEM_VOLATILITY_MAX   = 0.35;  // max 35% high-low range across 24h kline
-const STABLE_GEM_PRICE_CHANGE_MIN = -20;   // not dumping (24h change %)
-const STABLE_GEM_PRICE_CHANGE_MAX = 50;    // not already mooning (24h change %)
+const STABLE_GEM_VOLATILITY_MAX   = 0.35;
+const STABLE_GEM_PRICE_CHANGE_MIN = -20;
+const STABLE_GEM_PRICE_CHANGE_MAX = 50;
 const STABLE_GEM_VOLUME_MIN       = 50_000;
 const STABLE_GEM_HOLDER_MIN       = 200;
-const STABLE_GEM_BUY_RATIO_MIN    = 1.2;   // buy volume > sell volume
-const STABLE_GEM_MAX_AGE_DAYS     = 30;    // ignore coins >30 days old (dead accumulation, not healthy)
-const STABLE_GEM_COOLDOWN_MS      = 24 * 60 * 60 * 1000; // don't re-alert same token for 24h
+const STABLE_GEM_BUY_RATIO_MIN    = 1.2;
+const STABLE_GEM_MAX_AGE_DAYS     = 30;
+const STABLE_GEM_COOLDOWN_MS      = 24 * 60 * 60 * 1000;
+
+// ─── V12 ELITE FILTER VALUES (v7.3) ───────────────────────────────────────────
+// Ported from v12 "elite" code to cut the breakeven flood. Applied in hardFilter.
+const ELITE_MIN_HOLDERS   = 40;
+const ELITE_MIN_LIQ       = 7000;
+const ELITE_MAX_RUG       = 0.18;
+const ELITE_MAX_BUNDLE    = 0.25;
+const ELITE_MIN_SMART     = 1;
+const ELITE_MAX_TOP10     = 0.35;
+const ANTIFARM_HOLDERS    = 500;    // > this holders
+const ANTIFARM_MIN_VOL    = 10000;  // with < this volume = farm, reject
 
 const OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free";
 const AI_DAILY_LIMIT   = 200;
@@ -78,15 +88,14 @@ const insiderBuys        = {};
 const lastSig            = {};
 const blacklist          = new Set();
 let lastOpenAPICall      = 0;
+let rateLimitHits        = 0; // POLLING TEST: track 403/429 to measure if 20s is too aggressive
 let aiCallsToday         = 0;
 let aiResetTime          = Date.now() + 86400000;
 const blacklistedCreators = new Set();
 const creatorCache        = new Map();
 const devWalletCache      = new Map();
 const trustedDevs         = new Map();
-
-// Stable Gem state — separate from globalAlerted so it doesn't block other signals
-const stableGemAlerted   = new Map(); // mint -> timestamp
+const stableGemAlerted   = new Map();
 
 const botStats = {
   kol:        { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
@@ -133,23 +142,39 @@ function signalLabel(s) {
   return "LOW";
 }
 
-// ─── HARD FILTER ─────────────────────────────────────────────────────────────
+// ─── HARD FILTER (v7.3 — v12 ELITE values + anti-farm) ───────────────────────
+// Applied to KOL signals. Stricter than v7.2 to cut the breakeven flood.
+// Ultra/Pump/KOL-Early have their own dedicated filters and bypass this.
 function hardFilter(token) {
-  const liq      = token.liquidity         || 0;
-  const mc       = token.market_cap        || 0;
+  const liq      = token.liquidity          || 0;
+  const mc       = token.market_cap         || 0;
   const top10    = token.top_10_holder_rate || 0;
-  const honeypot = token.is_honeypot       || false;
-  const blacklisted = token.is_blacklist   || false;
-  const vol      = token.volume            || 0;
+  const honeypot = token.is_honeypot        || false;
+  const blacklisted = token.is_blacklist    || false;
+  const vol      = token.volume             || 0;
+  const holders  = token.holder_count       || 0;
+  const rug      = token.rug_ratio          || 0;
+  const bundle   = token.bundler_trader_amount_rate || 0;
+  const smart    = token.smart_degen_count  || 0;
 
-  if (liq < 5000)       return false;
-  if (vol < 1000)       return false;
+  // Base safety
   if (mc < MC_MIN)      return false;
   if (mc > MC_MAX)      return false;
   if (honeypot)         return false;
   if (blacklisted)      return false;
-  if (top10 > 0.50)     return false;
   if (blacklist.has(token.creator||"")) return false;
+
+  // v12 ELITE filter — stricter, cuts breakevens
+  if (holders < ELITE_MIN_HOLDERS) return false;  // was: not checked
+  if (liq < ELITE_MIN_LIQ)         return false;  // was: 5000
+  if (rug > ELITE_MAX_RUG)         return false;  // was: AI only
+  if (bundle > ELITE_MAX_BUNDLE)   return false;  // was: not checked
+  if (smart < ELITE_MIN_SMART)     return false;  // was: not checked
+  if (top10 > ELITE_MAX_TOP10)     return false;  // was: 0.50
+
+  // ANTI-FARM (v12) — many holders but no real volume = fake/airdropped
+  if (holders > ANTIFARM_HOLDERS && vol < ANTIFARM_MIN_VOL) return false;
+
   return true;
 }
 
@@ -198,7 +223,7 @@ bot.on("callback_query", async (q) => {
       await bot.answerCallbackQuery(q.id);
       const s=botStats;
       await bot.sendMessage(CHAT_ID,
-        `📊 *Apex v7 Stats*\n\n`+
+        `📊 *Apex v7.3 Stats*\n\n`+
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
@@ -442,22 +467,15 @@ const INSIDER_WALLETS = {
   "BQVz7fQ1WsQmSTMY3umdPEPPTm1sdcBcX9sP7o6kPRmB": "Axio_TTSk",
 };
 
-// ─── WEBHOOK SERVER (replaces pollInsiderWallets interval) ───────────────────
-// Helius POSTs swap events in real-time to /webhook
-// Much faster than polling — fires the instant an insider wallet swaps
+// ─── WEBHOOK SERVER ──────────────────────────────────────────────────────────
 function startWebhookServer() {
   const app = express();
-
-  // Parse raw body for signature verification
   app.use(express.json({
     verify: (req, res, buf) => { req.rawBody = buf; }
   }));
-
   app.get("/health", (req, res) => res.json({ status: "ok", uptime: process.uptime() }));
-
   app.post("/webhook", (req, res) => {
     try {
-      // Optional: verify Helius signature if secret is set
       if (WEBHOOK_SECRET) {
         const sig = req.headers["authorization"] || req.headers["x-helius-signature"] || "";
         if (sig && sig !== WEBHOOK_SECRET) {
@@ -465,9 +483,7 @@ function startWebhookServer() {
           return res.status(401).json({ error: "unauthorized" });
         }
       }
-
-      res.status(200).json({ ok: true }); // Acknowledge immediately
-
+      res.status(200).json({ ok: true });
       const events = Array.isArray(req.body) ? req.body : [req.body];
       for (const event of events) {
         processWebhookEvent(event).catch(e => log(`[Webhook] processEvent error: ${e.message}`));
@@ -477,7 +493,6 @@ function startWebhookServer() {
       res.status(500).json({ error: e.message });
     }
   });
-
   app.listen(WEBHOOK_PORT, () => {
     log(`[Webhook] Server listening on port ${WEBHOOK_PORT}`);
   });
@@ -485,60 +500,42 @@ function startWebhookServer() {
 
 async function processWebhookEvent(event) {
   const WSOL = "So11111111111111111111111111111111111111112";
-
-  // Helius enhanced transaction format
   const txType   = event.type || event.transactionType || "";
   const accounts = event.accountData || [];
   const transfers = event.tokenTransfers || [];
   const feePayer  = event.feePayer || "";
 
-  // Find which insider wallet triggered this event
   const walletName = INSIDER_WALLETS[feePayer];
   if (!walletName) {
-    // feePayer might not be the wallet — check all involved accounts
     const involved = accounts.map(a => a.account).filter(a => INSIDER_WALLETS[a]);
     if (!involved.length) return;
-    // Process for each matched insider wallet
     for (const wallet of involved) {
       await processInsiderTransfers(wallet, INSIDER_WALLETS[wallet], transfers, WSOL);
     }
     return;
   }
-
   await processInsiderTransfers(feePayer, walletName, transfers, WSOL);
 }
 
 async function processInsiderTransfers(wallet, name, transfers, WSOL) {
-  // Find tokens received by this wallet (buys)
   const bought = transfers.filter(t =>
     t.toUserAccount === wallet &&
     t.mint !== WSOL &&
     t.mint
   );
-
   for (const recv of bought) {
     if (!insiderBuys[recv.mint]) insiderBuys[recv.mint] = {};
     insiderBuys[recv.mint][name] = Date.now();
     log(`[Webhook] ⚡ REAL-TIME: ${name} bought ${recv.mint.slice(0,8)}`);
-
-    // Notify Telegram immediately — faster than waiting for next scan
     await bot.sendMessage(CHAT_ID,
-      `⚡ *Insider Buy Detected*
-
-` +
-      `👛 ${name}
-` +
-      `🪙 \`${recv.mint}\`
-` +
-      `💰 Amount: ${recv.tokenAmount ? recv.tokenAmount.toLocaleString() : "N/A"}
-
-` +
+      `⚡ *Insider Buy Detected*\n` +
+      `👛 ${name}\n` +
+      `🪙 \`${recv.mint}\`\n` +
+      `💰 Amount: ${recv.tokenAmount ? recv.tokenAmount.toLocaleString() : "N/A"}\n\n` +
       `_Bot will alert if this token qualifies in next scan_`,
       { parse_mode: "Markdown" }
     ).catch(() => {});
   }
-
-  // Also track sells — useful context
   const sold = transfers.filter(t =>
     t.fromUserAccount === wallet &&
     t.mint !== WSOL &&
@@ -546,7 +543,6 @@ async function processInsiderTransfers(wallet, name, transfers, WSOL) {
   );
   for (const send of sold) {
     log(`[Webhook] 📤 ${name} sold/sent ${send.mint.slice(0,8)}`);
-    // Remove from insiderBuys if they fully exited
     if (insiderBuys[send.mint]?.[name]) {
       delete insiderBuys[send.mint][name];
       log(`[Webhook] Removed ${name} buy for ${send.mint.slice(0,8)} (sold)`);
@@ -554,13 +550,10 @@ async function processInsiderTransfers(wallet, name, transfers, WSOL) {
   }
 }
 
-// ─── HELIUS DAS: KOL HOLDER VERIFICATION (Feature 5) ─────────────────────────
-// Before sending KOL/KOL Early alerts, verify KOL wallets still hold the token
-// Pulls holder list from GMGN, cross-checks balances via Helius DAS API
+// ─── HELIUS DAS: KOL HOLDER VERIFICATION ─────────────────────────────────────
 async function verifyKOLsStillHolding(tokenMint, expectedKolCount) {
   if (!HELIUS_API_KEY || expectedKolCount === 0) return { verified: false, stillHolding: 0, label: "" };
   try {
-    // Step 1: Get token holders from GMGN
     const holdersData = await fetchOpenAPI("/v1/token/holders", {
       chain: "sol",
       address: tokenMint,
@@ -569,32 +562,14 @@ async function verifyKOLsStillHolding(tokenMint, expectedKolCount) {
     const holders = extractList(holdersData);
     if (!holders.length) return { verified: false, stillHolding: 0, label: "⚠️ Holders N/A" };
 
-    // Step 2: Find wallets tagged as renowned/KOL/smart
     const kolWallets = holders
       .filter(h => h.is_renowned || h.is_smart_degen || h.tag === "kol" || h.wallet_tag === "kol")
       .map(h => h.address || h.wallet)
       .filter(Boolean)
-      .slice(0, 10); // cap at 10 to limit DAS calls
+      .slice(0, 10);
 
     if (!kolWallets.length) return { verified: false, stillHolding: 0, label: "⚠️ KOL wallets not identified" };
 
-    // Step 3: Batch check balances via Helius DAS
-    const res = await axios.post(
-      `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`,
-      {
-        jsonrpc: "2.0",
-        id: "kol-check",
-        method: "getTokenAccountsByOwner",
-        params: [
-          kolWallets[0], // DAS getTokenAccountsByOwner is per-wallet
-          { mint: tokenMint },
-          { encoding: "jsonParsed" }
-        ]
-      },
-      { timeout: 8000 }
-    );
-
-    // For multiple wallets, check each sequentially (capped at 5)
     let stillHolding = 0;
     const walletsToCheck = kolWallets.slice(0, 5);
     for (const wallet of walletsToCheck) {
@@ -624,14 +599,12 @@ async function verifyKOLsStillHolding(tokenMint, expectedKolCount) {
 
     log(`[KOL Check] ${tokenMint.slice(0,8)}: ${stillHolding}/${walletsToCheck.length} KOLs still holding`);
     return { verified: true, stillHolding, total: walletsToCheck.length, label };
-
   } catch(e) {
     log(`[KOL Check] error: ${e.message}`);
     return { verified: false, stillHolding: 0, label: "" };
   }
 }
 
-// Cleanup stale insider buys — still needed, runs periodically
 function cleanupInsiderBuys() {
   const cutoff = Date.now() - 7200000;
   for (const [mint, buyers] of Object.entries(insiderBuys)) {
@@ -756,6 +729,7 @@ async function fetchOpenAPI(subPath, params={}, method="GET") {
       res=await axiosAPI.get(url,{headers});
     }
     if (res.status===405&&method==="GET") return fetchOpenAPI(subPath,params,"POST");
+    if (res.status===403||res.status===429) { rateLimitHits++; log(`⚠️ RATE LIMIT #${rateLimitHits}: OpenAPI ${res.status} — 20s polling may be too aggressive`); return null; }
     if (res.status!==200||typeof res.data==="string") { log(`OpenAPI ${res.status}: ${JSON.stringify(res.data)?.slice(0,100)}`); return null; }
     if (res.data?.code!==0) { log(`OpenAPI err: ${res.data?.error} ${res.data?.message}`); return null; }
     log(`OpenAPI OK: ${subPath}`);
@@ -998,20 +972,13 @@ function processKOLEarlyList(list, seen, results) {
   }
 }
 
-// ─── STABLE GEM SIGNAL (NEW v7) ───────────────────────────────────────────────
-// Scans for tokens $500K–$1M MC that have been price-stable for 24h+
-// These are accumulation-phase coins — ideal re-entry or breakout candidates.
-// Runs on its own 10-minute interval, independent of the main scan.
-
+// ─── STABLE GEM SIGNAL (v7) ───────────────────────────────────────────────────
 async function fetchStableGemCandidates() {
-  // Use the same public rank endpoint as KOL, but filter the 500K–1M MC band
-  // orderby=marketcap gives us tokens sorted by size — efficient for range filter
   const url = `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/24h?orderby=marketcap&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`;
   try {
     const data = await fetchPublic(url);
     const list = data?.data?.rank || [];
     if (!list.length) {
-      // Fallback to OpenAPI
       log("[StableGem] Public failed — trying OpenAPI");
       const apiData = await fetchOpenAPI("/v1/market/rank", {
         chain:"sol", interval:"24h", orderby:"marketcap", direction:"desc", limit:"100"
@@ -1026,16 +993,13 @@ async function fetchStableGemCandidates() {
 }
 
 async function fetchTokenKlineVolatility(address) {
-  // Fetch 6 x 4h candles = 24h window
-  // Returns volatility ratio: (overallHigh - overallLow) / overallLow
-  // A low ratio = price has been stable = healthy accumulation
   try {
     const to   = Math.floor(Date.now() / 1000);
-    const from = to - (6 * 4 * 3600); // 24h back
+    const from = to - (6 * 4 * 3600);
     const url  = `https://gmgn.ai/defi/quotation/v1/tokens/kline/sol/${address}?resolution=4h&from=${from}&to=${to}`;
     const data = await fetchPublic(url);
     const candles = data?.data?.list || data?.data?.ohlcv || data?.data || [];
-    if (!Array.isArray(candles) || candles.length < 3) return null; // need enough data
+    if (!Array.isArray(candles) || candles.length < 3) return null;
     const highs = candles.map(c => parseFloat(c.high || c[2] || 0));
     const lows  = candles.map(c => parseFloat(c.low  || c[3] || 0));
     const overallHigh = Math.max(...highs);
@@ -1052,8 +1016,6 @@ async function runStableGemScan() {
   log("[StableGem] Scanning...");
   try {
     const allCandidates = await fetchStableGemCandidates();
-
-    // Phase 1: hard filter by MC range, volume, holders, price change
     const filtered = allCandidates.filter(t => {
       const mc         = t.market_cap || t.usd_market_cap || 0;
       const vol        = t.volume || t.volume_24h || 0;
@@ -1061,31 +1023,21 @@ async function runStableGemScan() {
       const priceChg   = t.price_change_percent24h ?? t.price_change_percent1h ?? null;
       const wash       = t.is_wash_trading || false;
       const honeypot   = t.is_honeypot || false;
-
-      // FIX 1: Reject frozen/blacklist tokens — dev can freeze wallets = rug vector
       const frozen      = t.is_freeze_authority || t.freeze_authority || t.token_frozen || false;
       const blacklisted = t.is_blacklist || t.blacklist || false;
       if (frozen || blacklisted) return false;
-
       if (mc < STABLE_GEM_MC_MIN || mc > STABLE_GEM_MC_MAX) return false;
       if (vol < STABLE_GEM_VOLUME_MIN)   return false;
       if (holders < STABLE_GEM_HOLDER_MIN) return false;
       if (wash || honeypot)              return false;
-
-      // FIX 2: Age cap — coin stable for >30 days at this MC is a corpse, not accumulation
       const tokenAgeMs = t.open_timestamp ? (Date.now() - t.open_timestamp * 1000) : null;
       if (tokenAgeMs && tokenAgeMs > STABLE_GEM_MAX_AGE_DAYS * 86400000) return false;
-
-      // FIX 4: Require recent activity — zero 1h volume = no live interest right now
       const recentVol = t.volume_1h || t.volume_5m || 0;
       if (recentVol === 0) return false;
-
-      // Price change filter — must be in "stable" range (not dumping, not already mooning)
       if (priceChg !== null) {
         if (priceChg < STABLE_GEM_PRICE_CHANGE_MIN) return false;
         if (priceChg > STABLE_GEM_PRICE_CHANGE_MAX) return false;
       }
-      // Skip already alerted (24h cooldown for stable gem specifically)
       if (stableGemAlerted.has(t.address) &&
           Date.now() - stableGemAlerted.get(t.address) < STABLE_GEM_COOLDOWN_MS) return false;
       return true;
@@ -1094,40 +1046,32 @@ async function runStableGemScan() {
     log(`[StableGem] ${filtered.length} candidates after MC/vol filter`);
     if (!filtered.length) return;
 
-    // Phase 2: kline volatility check (sequential, GMGN-safe)
     const gems = [];
-    for (const token of filtered.slice(0, 25)) { // cap at 25 to limit API calls
-      await new Promise(r => setTimeout(r, 2000)); // 2s gap between kline calls
+    for (const token of filtered.slice(0, 25)) {
+      await new Promise(r => setTimeout(r, 2000));
       const volatility = await fetchTokenKlineVolatility(token.address);
       if (volatility === null) continue;
       if (volatility > STABLE_GEM_VOLATILITY_MAX) continue;
-
-      // FIX 3: B/S ratio — fail CLOSED when null (can't confirm accumulation = skip)
       const buyVol  = token.buy_volume_24h  || token.buy_volume  || 0;
       const sellVol = token.sell_volume_24h || token.sell_volume || 0;
       const buySellRatio = sellVol > 0 ? buyVol / sellVol : buyVol > 0 ? 2 : null;
       if (!buySellRatio || buySellRatio < STABLE_GEM_BUY_RATIO_MIN) continue;
-
       gems.push({ token, volatility, buySellRatio });
       log(`[StableGem] ✅ ${token.symbol} MC:${fmt(token.market_cap)} vol:${(volatility*100).toFixed(1)}%`);
     }
 
-    // Sort by most stable (lowest volatility) first
     gems.sort((a, b) => a.volatility - b.volatility);
 
-    // Send top 2 gems per scan
     for (const { token, volatility, buySellRatio } of gems.slice(0, 2)) {
       stableGemAlerted.set(token.address, Date.now());
       await sendStableGemAlert(token, volatility, buySellRatio);
       await new Promise(r => setTimeout(r, 1500));
     }
 
-    // Cleanup old stable gem cooldowns
     const now = Date.now();
     for (const [k, ts] of stableGemAlerted.entries()) {
       if (now - ts > STABLE_GEM_COOLDOWN_MS) stableGemAlerted.delete(k);
     }
-
   } catch(e) {
     log(`[StableGem] scan error: ${e.message}`);
   }
@@ -1146,13 +1090,11 @@ async function sendStableGemAlert(token, volatility, buySellRatio) {
   const smart     = token.smart_degen_count || 0;
   const kol       = token.renowned_count || 0;
 
-  // Stability tier label
   let tierLabel;
   if (volatility <= 0.10)      tierLabel = "🧊 ULTRA STABLE";
   else if (volatility <= 0.20) tierLabel = "💎 VERY STABLE";
   else                          tierLabel = "📊 STABLE";
 
-  // Trusted dev badge
   const creator = token.creator || token.creator_address || "";
   let trustedBadge = "";
   let devQualityStr = "";
@@ -1202,7 +1144,6 @@ async function sendStableGemAlert(token, volatility, buySellRatio) {
     reply_markup: keyboard
   });
 
-  // Track performance just like other signals
   if (token.price) {
     await trackPerformance(mint, parseFloat(token.price), mc, sym, sent.message_id, "stableGem", creator);
   }
@@ -1218,7 +1159,7 @@ async function sendStableGemAlert(token, volatility, buySellRatio) {
     alert_mc: mc || null,
     smart_degen_count: smart,
     rug_ratio: token.rug_ratio || 0,
-    ai_decision: "APPROVED", // No AI filter for stable gem — criteria are tight enough
+    ai_decision: "APPROVED",
     ai_confidence: stability,
     has_socials: !!(token.twitter||token.telegram||token.website),
     dev_wallet: creator || null,
@@ -1231,11 +1172,9 @@ function getSocials(token) {
   const tw = token.twitter || token.twitter_username;
   const tg = token.telegram;
   const web = token.website;
-
   if (tw)  parts.push(`[X](${tw.startsWith("http") ? tw : "https://x.com/"+tw})`);
   if (tg)  parts.push(`[TG](${tg.startsWith("http") ? tg : "https://t.me/"+tg})`);
   if (web) parts.push(`[Web](${web})`);
-
   if (parts.length === 0) return "No socials ⚠️";
   return parts.join(" | ");
 }
@@ -1246,13 +1185,11 @@ function getDexPromo(token) {
   const trending = token.dexscr_trending_bar === 1 || token.dexscr_trending_bar === true;
   const boost   = parseFloat(token.dexscr_boost_fee || 0) > 0;
   const updated = token.dexscr_update_link  === 1 || token.dexscr_update_link  === true;
-
   const promos = [];
   if (ad)       promos.push("Ad");
   if (trending) promos.push("Trending Bar");
   if (boost)    promos.push(`Boost $${token.dexscr_boost_fee}`);
   if (updated)  promos.push("Links Updated");
-
   if (promos.length === 0) return "❌ No paid promotion";
   return `✅ ${promos.join(" + ")}`;
 }
@@ -1261,7 +1198,7 @@ function getDexPromo(token) {
 function buildKeyboard(mint,isPump) {
   return {inline_keyboard:[
     [{text:"🚀 BUY 0.1 SOL via Trojan",url:`https://t.me/solana_trojanbot?start=ca_${mint}`}],
-    [{text:"📊 DexScreener",url:`https://dexscreener.com/solana/${mint}`},{text:"🔍 GMGN",url:`https://gmgn.ai/sol/token/${mint}`}],
+    [{text:"📊 DexScreener",url:`https://dexscreener.com/solana/${mint}`},{text:"🔍 GMGN",url:`https://www.google.com/url?q=https://gmgn.ai/sol/token/${mint}`}],
     [{text:isPump?"🎯 PumpFun":"⚡ Axiom",url:isPump?`https://pump.fun/${mint}`:`https://axiom.trade/t/${mint}`},{text:"📈 Stats",callback_data:"stats"}],
     [{text:"❌ Skip",callback_data:`skip_${mint.slice(0,20)}`}],
   ]};
@@ -1281,7 +1218,6 @@ async function sendKOLAlert(token,ai) {
   const insiderStr=insiders.length>0?`\n└ 👛 ${insiders.join(", ")}`:"";
   const devQualityStr = token._devQuality ? `\n└ 🧑‍💻 ${fmtDevQuality(token._devQuality)}` : "";
   const trustedBadge = token._isTrustedDev ? `🌟 *TRUSTED 10x DEV* (made ${(token._trustedDevInfo?.best_x||0).toFixed(1)}x before!)\n` : "";
-  // Feature 5: verify KOLs still holding via Helius DAS
   const kolCheck = await verifyKOLsStillHolding(mint, token.renowned_count||0);
   const kolHoldStr = kolCheck.label ? `\n└ ${kolCheck.label}` : '';
   const msg=
@@ -1413,7 +1349,6 @@ async function sendKOLEarlyAlert(token,ai) {
   const smart=token.smart_degen_count||0;
   const riskEmoji=ai.risk==="LOW"?"🟢":ai.risk==="MEDIUM"?"🟡":"🔴";
   const trustedBadge = token._isTrustedDev ? `🌟 *TRUSTED 10x DEV* (made ${(token._trustedDevInfo?.best_x||0).toFixed(1)}x before!)\n` : "";
-  // Feature 5: verify KOLs still holding
   const kolCheck = await verifyKOLsStillHolding(mint, token.renowned_count||0);
   const kolHoldStr = kolCheck.label ? `\n└ ${kolCheck.label}` : '';
   const devQualityStr = token._devQuality ? `🧑‍💻 ${fmtDevQuality(token._devQuality)}\n` : "";
@@ -1456,7 +1391,7 @@ async function sendKOLEarlyAlert(token,ai) {
 // ─── MAIN SCAN ────────────────────────────────────────────────────────────────
 async function scan() {
   log("Scanning...");
-  cleanupInsiderBuys(); // webhook handles real-time detection; just clean stale buys here
+  cleanupInsiderBuys();
   const [kolTokens,pumpTokens,ultraTokens,kolEarlyTokens]=await Promise.all([
     getKOLSignals(), getPumpSignals(), getUltraSignals(), getKOLEarlySignals()
   ]);
@@ -1522,7 +1457,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7.2 — Webhook insider tracking + Helius KOL verification");
+  log("⚡ Apex v7.3 POLLING TEST — 20s scan interval");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1530,15 +1465,16 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7.2 Online*\n\n`+
-    `🔧 Stable Gem hardened:\n`+
-    `  • Frozen/blacklist tokens blocked\n`+
-    `  • Max age 30 days (no corpse coins)\n`+
-    `  • B/S ratio fail-closed (N/A = reject)\n`+
-    `  • Requires live 1h volume\n\n`+
+    `⚡ *Apex v7.3 POLLING TEST Online*\n\n`+
+    `⚡ 20s polling (3x faster — watch for 403s!)\n`+
+    `🔧 NEW: Stricter KOL filter (v12 elite values)\n`+
+    `  • Holders ≥40, Liq ≥$7K, Rug <18%\n`+
+    `  • Bundle <25%, Smart ≥1, Top10 <35%\n`+
+    `  • Anti-farm: blocks fake holder counts\n`+
+    `  → Cuts breakeven flood, raises quality\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 5 Signals: KOL + Pump + Ultra + 👑 KOL Early + 📊 Stable Gem\n`+
-    `📊 NEW: Stable Gem — $500K–$1M MC, stable 24h+, accumulation zone\n`+
+    `📊 Stable Gem — $500K–$1M MC, stable 24h+\n`+
     `👑 KOL Early — 2+ KOLs in fresh tokens <$100K\n`+
     `🤖 AI: OpenRouter Llama 3.3 70B (200/day)\n`+
     `🌐 Social warnings on all alerts\n`+
@@ -1547,21 +1483,17 @@ async function main() {
     `🧑‍💻 Dev wallet ATH quality check\n`+
     `🌟 Auto-track 10x devs (priority alerts)\n`+
     `🔍 Copycat detection\n`+
-    `👛 6 Insider wallets tracked\n`+
+    `👛 6 Insider wallets (webhook real-time)\n`+
     `📊 2x/5x/10x milestone alerts\n\n`+
-    `Main scan: every 60s | Stable Gem: every 10min 🔥`,
+    `Main scan: every 20s ⚡ | Stable Gem: every 10min 🔥`,
     {parse_mode:"Markdown"}
   );
 
-  // Main signal scan — every 60 seconds (unchanged)
-  // Start webhook server — replaces polling, receives Helius push events
   startWebhookServer();
 
   await scan();
   setInterval(scan, POLL_INTERVAL_MS);
 
-  // Stable Gem scan — independent 10-minute cycle
-  // Stagger by 30s so it doesn't collide with the first main scan
   setTimeout(() => {
     runStableGemScan();
     setInterval(runStableGemScan, STABLE_GEM_INTERVAL_MS);
