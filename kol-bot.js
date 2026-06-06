@@ -1107,8 +1107,8 @@ async function sendStableGemAlert(token, volatility, buySellRatio) {
     if (devQ) devQualityStr = `\n└ 🧑‍💻 ${fmtDevQuality(devQ)}`;
   }
 
-  const dexUrl  = `https://www.google.com/url?q=https://dexscreener.com/solana/${mint}`;
-  const gmgnUrl = `https://www.google.com/url?q=https://gmgn.ai/sol/token/${mint}`;
+  const dexUrl  = `https://dexscreener.com/solana/${mint}`;
+  const gmgnUrl = `https://gmgn.ai/sol/token/${mint}`;
 
   const msg =
     `📊 *STABLE GEM* — ${tierLabel}\n` +
@@ -1198,7 +1198,7 @@ function getDexPromo(token) {
 function buildKeyboard(mint,isPump) {
   return {inline_keyboard:[
     [{text:"🚀 BUY 0.1 SOL via Trojan",url:`https://t.me/solana_trojanbot?start=ca_${mint}`}],
-    [{text:"📊 DexScreener",url:`https://dexscreener.com/solana/${mint}`},{text:"🔍 GMGN",url:`https://www.google.com/url?q=https://gmgn.ai/sol/token/${mint}`}],
+    [{text:"📊 DexScreener",url:`https://dexscreener.com/solana/${mint}`},{text:"🔍 GMGN",url:`https://gmgn.ai/sol/token/${mint}`}],
     [{text:isPump?"🎯 PumpFun":"⚡ Axiom",url:isPump?`https://pump.fun/${mint}`:`https://axiom.trade/t/${mint}`},{text:"📈 Stats",callback_data:"stats"}],
     [{text:"❌ Skip",callback_data:`skip_${mint.slice(0,20)}`}],
   ]};
