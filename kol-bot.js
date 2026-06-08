@@ -26,7 +26,7 @@ const WEBHOOK_PORT   = parseInt(process.env.PORT) || 3000;
 // ─── ORIGINAL V12 FILTERS ────────────────────────────────────────────────────
 const MC_MIN              = 15000;
 const MC_MAX              = 150000;
-const POLL_INTERVAL_MS    = 20000; // POLLING TEST: 20s (was 60s)
+const POLL_INTERVAL_MS    = 60000;
 const ALERT_COOLDOWN_MS   = 3600000;
 const MAX_TOKEN_AGE_MS    = 24 * 60 * 60 * 1000;
 const REENTRY_MIN_VOLUME  = 50000;
@@ -88,7 +88,6 @@ const insiderBuys        = {};
 const lastSig            = {};
 const blacklist          = new Set();
 let lastOpenAPICall      = 0;
-let rateLimitHits        = 0; // POLLING TEST: track 403/429 to measure if 20s is too aggressive
 let aiCallsToday         = 0;
 let aiResetTime          = Date.now() + 86400000;
 const blacklistedCreators = new Set();
@@ -223,7 +222,7 @@ bot.on("callback_query", async (q) => {
       await bot.answerCallbackQuery(q.id);
       const s=botStats;
       await bot.sendMessage(CHAT_ID,
-        `📊 *Apex v7.3 Stats*\n\n`+
+        `📊 *Apex v7.4 Stats*\n\n`+
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
@@ -729,7 +728,6 @@ async function fetchOpenAPI(subPath, params={}, method="GET") {
       res=await axiosAPI.get(url,{headers});
     }
     if (res.status===405&&method==="GET") return fetchOpenAPI(subPath,params,"POST");
-    if (res.status===403||res.status===429) { rateLimitHits++; log(`⚠️ RATE LIMIT #${rateLimitHits}: OpenAPI ${res.status} — 20s polling may be too aggressive`); return null; }
     if (res.status!==200||typeof res.data==="string") { log(`OpenAPI ${res.status}: ${JSON.stringify(res.data)?.slice(0,100)}`); return null; }
     if (res.data?.code!==0) { log(`OpenAPI err: ${res.data?.error} ${res.data?.message}`); return null; }
     log(`OpenAPI OK: ${subPath}`);
@@ -755,6 +753,11 @@ async function enrichToken(token) {
       is_blacklist:         s.is_blacklist          ?? false,
       dev_token_burn_ratio: s.dev_token_burn_ratio  ?? 0,
       rug_ratio:            token.rug_ratio         ?? 0,
+      // v7.4 insider fields (from GMGN security endpoint)
+      bundler_trader_amount_rate: s.bundler_trader_amount_rate ?? token.bundler_trader_amount_rate,
+      rat_trader_amount_rate:     s.rat_trader_amount_rate     ?? token.rat_trader_amount_rate,
+      sniper_count:               s.sniper_count               ?? token.sniper_count,
+      is_wash_trading:            s.is_wash_trading            ?? token.is_wash_trading,
     };
   } catch(e) {
     log(`Enrich error for ${token.address?.slice(0,8)}: ${e.message}`);
@@ -1194,6 +1197,65 @@ function getDexPromo(token) {
   return `✅ ${promos.join(" + ")}`;
 }
 
+// ─── INSIDER ANALYSIS (v7.4) ─────────────────────────────────────────────────
+// Surfaces the GMGN insider/manipulation fields we already fetch but never showed.
+// Confirmed field names from GMGNAI/gmgn-skills repo:
+//   bundler_trader_amount_rate — % volume from bot-bundled launch buys
+//   rat_trader_amount_rate     — % volume from insider/sneak wallets
+//   sniper_count               — wallets that bought at exact launch moment
+//   is_wash_trading            — coordinated fake volume flag
+// GMGN's official manipulation threshold: any rate > 0.30 = high risk.
+function getInsiderAnalysis(token) {
+  const bundler = token.bundler_trader_amount_rate ?? token.bundler_rate ?? null;
+  const rat     = token.rat_trader_amount_rate ?? null;
+  const snipers = token.sniper_count ?? null;
+  const wash    = token.is_wash_trading || false;
+  const top10   = token.top_10_holder_rate ?? null;
+
+  // Build a risk score from the available signals (GMGN threshold: >0.3 = high)
+  let riskPoints = 0;
+  const lines = [];
+
+  if (bundler !== null) {
+    const pct = (bundler * 100).toFixed(0);
+    const flag = bundler > 0.3 ? "🔴" : bundler > 0.15 ? "🟡" : "🟢";
+    lines.push(`├ Bundlers: ${pct}% ${flag}`);
+    if (bundler > 0.3) riskPoints += 2; else if (bundler > 0.15) riskPoints += 1;
+  }
+  if (rat !== null) {
+    const pct = (rat * 100).toFixed(0);
+    const flag = rat > 0.3 ? "🔴" : rat > 0.15 ? "🟡" : "🟢";
+    lines.push(`├ Insider/rat: ${pct}% ${flag}`);
+    if (rat > 0.3) riskPoints += 2; else if (rat > 0.15) riskPoints += 1;
+  }
+  if (snipers !== null) {
+    const flag = snipers > 15 ? "🔴" : snipers > 5 ? "🟡" : "🟢";
+    lines.push(`├ Snipers: ${snipers} wallets ${flag}`);
+    if (snipers > 15) riskPoints += 2; else if (snipers > 5) riskPoints += 1;
+  }
+  if (top10 !== null) {
+    const pct = (top10 * 100).toFixed(0);
+    const flag = top10 > 0.4 ? "🔴" : top10 > 0.25 ? "🟡" : "🟢";
+    lines.push(`├ Top 10 hold: ${pct}% ${flag}`);
+    if (top10 > 0.4) riskPoints += 2; else if (top10 > 0.25) riskPoints += 1;
+  }
+  if (wash) { lines.push(`├ ⚠️ Wash trading detected`); riskPoints += 3; }
+
+  // If GMGN gave us none of these fields, say so honestly rather than fake a score
+  if (lines.length === 0) return "🕵️ Insider data: N/A (check Bubblemaps)";
+
+  // Overall risk label
+  let riskLabel;
+  if (riskPoints >= 5)      riskLabel = "🔴 HIGH insider risk";
+  else if (riskPoints >= 2) riskLabel = "🟡 MEDIUM insider risk";
+  else                       riskLabel = "🟢 LOW insider risk";
+
+  // Replace last line's ├ with └ for clean formatting
+  lines[lines.length-1] = lines[lines.length-1].replace("├", "└");
+
+  return `🕵️ *Insider Analysis* — ${riskLabel}\n${lines.join("\n")}`;
+}
+
 // ─── KEYBOARD ─────────────────────────────────────────────────────────────────
 function buildKeyboard(mint,isPump) {
   return {inline_keyboard:[
@@ -1243,6 +1305,7 @@ async function sendKOLAlert(token,ai) {
     `├ Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
     `├ 📢 DEX: ${getDexPromo(token)}\n`+
     `└ 🌐 ${getSocials(token)}${devQualityStr}\n\n`+
+    `${getInsiderAnalysis(token)}\n\n`+
     `💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,false)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol",token.creator||token.creator_address||"");
@@ -1280,7 +1343,8 @@ async function sendPumpAlert(token,ai) {
     `Vol: ${fmt(token.volume||0)} | Smart: ${token.smart_degen_count||0} 🤖 | KOL: ${token.renowned_count||0} 👑\n`+
     `📢 DEX: ${getDexPromo(token)}\n`+
     `🌐 ${getSocials(token)}\n`+
-    `${devQualityStr}\n`+
+    `${devQualityStr}`+
+    `${getInsiderAnalysis(token)}\n\n`+
     `⚡ Buy before Raydium migration!\n💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump",token.creator||token.creator_address||"");
@@ -1323,7 +1387,8 @@ async function sendUltraAlert(token,ai) {
     `Smart: ${token.smart_degen_count||0} 🤖 | Rug: ${((token.rug_ratio||0)*100).toFixed(0)}%\n`+
     `📢 DEX: ${getDexPromo(token)}\n`+
     `🌐 ${getSocials(token)}\n`+
-    `${devQualityStr}\n`+
+    `${devQualityStr}`+
+    `${getInsiderAnalysis(token)}\n\n`+
     `💰 *Snipe 0.1 SOL?* — Always DYOR`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra",token.creator||token.creator_address||"");
@@ -1369,7 +1434,8 @@ async function sendKOLEarlyAlert(token,ai) {
     `├ Vol:   ${fmt(token.volume||0)}\n`+
     `└ Rug:   ${((token.rug_ratio||0)*100).toFixed(0)}%\n\n`+
     `🌐 ${getSocials(token)}\n`+
-    `${devQualityStr}\n`+
+    `${devQualityStr}`+
+    `${getInsiderAnalysis(token)}\n\n`+
     `💰 *Snipe early — higher risk, higher reward*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kolEarly",token.creator||token.creator_address||"");
@@ -1457,7 +1523,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7.3 POLLING TEST — 20s scan interval");
+  log("⚡ Apex v7.4 — insider analysis panel added");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1465,13 +1531,13 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7.3 POLLING TEST Online*\n\n`+
-    `⚡ 20s polling (3x faster — watch for 403s!)\n`+
+    `⚡ *Apex v7.4 Online*\n\n`+
     `🔧 NEW: Stricter KOL filter (v12 elite values)\n`+
     `  • Holders ≥40, Liq ≥$7K, Rug <18%\n`+
     `  • Bundle <25%, Smart ≥1, Top10 <35%\n`+
     `  • Anti-farm: blocks fake holder counts\n`+
-    `  → Cuts breakeven flood, raises quality\n\n`+
+    `  → Cuts breakeven flood, raises quality\n`+
+    `🕵️ NEW: Insider Analysis panel (bundlers, snipers, rat traders)\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 5 Signals: KOL + Pump + Ultra + 👑 KOL Early + 📊 Stable Gem\n`+
     `📊 Stable Gem — $500K–$1M MC, stable 24h+\n`+
@@ -1485,7 +1551,7 @@ async function main() {
     `🔍 Copycat detection\n`+
     `👛 6 Insider wallets (webhook real-time)\n`+
     `📊 2x/5x/10x milestone alerts\n\n`+
-    `Main scan: every 20s ⚡ | Stable Gem: every 10min 🔥`,
+    `Main scan: every 60s | Stable Gem: every 10min 🔥`,
     {parse_mode:"Markdown"}
   );
 
