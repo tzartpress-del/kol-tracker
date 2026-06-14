@@ -222,7 +222,7 @@ bot.on("callback_query", async (q) => {
       await bot.answerCallbackQuery(q.id);
       const s=botStats;
       await bot.sendMessage(CHAT_ID,
-        `📊 *Apex v7.4 Stats*\n\n`+
+        `📊 *Apex v7.6 Stats*\n\n`+
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
@@ -1182,6 +1182,71 @@ function getSocials(token) {
   return parts.join(" | ");
 }
 
+// ─── SOCIAL TRUST ANALYSIS (v7.5) ────────────────────────────────────────────
+// Free social-legitimacy signals (no paid X API). Flags the cheap-but-real
+// scam tells: missing socials, late-added/changed links, and recycled Twitter
+// handles (scammers reuse the same X handle across many rugged tokens).
+const twitterHandleHistory = new Map(); // handle -> Set of mints seen using it
+
+function normalizeHandle(tw) {
+  if (!tw) return null;
+  // Extract the handle from a URL or raw string
+  let h = tw.toLowerCase().trim();
+  h = h.replace(/^https?:\/\/(www\.)?(x|twitter)\.com\//, "");
+  h = h.replace(/^@/, "");
+  h = h.split(/[/?]/)[0]; // drop path/query
+  return h || null;
+}
+
+// Track handle usage across tokens — call when processing each token
+function recordTwitterHandle(token) {
+  const handle = normalizeHandle(token.twitter || token.twitter_username);
+  if (!handle) return 0;
+  if (!twitterHandleHistory.has(handle)) twitterHandleHistory.set(handle, new Set());
+  const set = twitterHandleHistory.get(handle);
+  set.add(token.address);
+  return set.size; // how many distinct tokens have used this handle
+}
+
+function getSocialTrust(token) {
+  const tw  = token.twitter || token.twitter_username;
+  const tg  = token.telegram;
+  const web = token.website;
+  const count = (tw?1:0) + (tg?1:0) + (web?1:0);
+
+  // Late/changed links — GMGN flag we already pull
+  const linksUpdated = token.dexscr_update_link === 1 || token.dexscr_update_link === true;
+
+  // Recycled handle check
+  const handle = normalizeHandle(tw);
+  const reuse = handle ? (twitterHandleHistory.get(handle)?.size || 0) : 0;
+
+  let trustPoints = 0;
+  const lines = [];
+
+  // Presence (legit projects usually have all 3)
+  if (count === 3)      { lines.push("├ Links: X + TG + Web ✅"); trustPoints += 2; }
+  else if (count === 2) { lines.push("├ Links: 2 of 3 🟡"); trustPoints += 1; }
+  else if (count === 1) { lines.push("├ Links: only 1 ⚠️"); }
+  else                  { lines.push("├ Links: NONE 🔴"); trustPoints -= 1; }
+
+  // Recycled Twitter handle — strong scam signal
+  if (reuse >= 3)      { lines.push(`├ ⚠️ X handle reused on ${reuse} tokens 🔴`); trustPoints -= 3; }
+  else if (reuse === 2){ lines.push(`├ X handle seen on 2 tokens 🟡`); trustPoints -= 1; }
+
+  // Late-added / changed links
+  if (linksUpdated) { lines.push("├ Links recently changed 🟡"); trustPoints -= 1; }
+
+  // Verdict
+  let label;
+  if (trustPoints >= 2)      label = "🟢 LEGIT signals";
+  else if (trustPoints >= 0) label = "🟡 MIXED signals";
+  else                        label = "🔴 WEAK/suspicious";
+
+  lines[lines.length-1] = lines[lines.length-1].replace("├", "└");
+  return `🔎 *Social Trust* — ${label}\n${lines.join("\n")}`;
+}
+
 // ─── DEX PROMOTION HELPER ────────────────────────────────────────────────────
 function getDexPromo(token) {
   const ad      = token.dexscr_ad          === 1 || token.dexscr_ad      === true;
@@ -1256,6 +1321,64 @@ function getInsiderAnalysis(token) {
   return `🕵️ *Insider Analysis* — ${riskLabel}\n${lines.join("\n")}`;
 }
 
+// ─── PRIME SETUP DETECTOR (v7.6) ─────────────────────────────────────────────
+// Pattern observed to outperform (the 37x signature): genuine hype, not insider rug.
+//   • Insider/rat LOW (<10%)      — no sneaky insider wallets ready to dump
+//   • Top 10 hold LOW (<30%)      — distributed, not whale/single-entity controlled
+//   • Snipers PRESENT (>=8)       — real early demand/hype (not one bundle)
+//   • Not wash trading
+// Bundlers can be high here — when paired with low rat + low top10, it reads as
+// competing snipers rather than one coordinated rug.
+// Returns {isPrime, reasons[]} — used to fire a flashy instant-buy alert.
+const PRIME_MAX_RAT    = 0.10;  // insider/rat must be under 10%
+const PRIME_MAX_TOP10  = 0.30;  // top 10 holders under 30%
+const PRIME_MIN_SNIPER = 8;     // at least 8 snipers = real demand
+const PRIME_MIN_SMART  = 1;     // at least 1 smart money confirms
+
+function detectPrimeSetup(token) {
+  const rat     = token.rat_trader_amount_rate ?? null;
+  const snipers = token.sniper_count ?? null;
+  const top10   = token.top_10_holder_rate ?? null;
+  const smart   = token.smart_degen_count || 0;
+  const wash    = token.is_wash_trading || false;
+  const honeypot= token.is_honeypot || false;
+
+  // Need the core fields present to judge — if missing, can't confirm prime
+  if (rat === null || top10 === null || snipers === null) return { isPrime:false };
+  if (wash || honeypot) return { isPrime:false };
+
+  const reasons = [];
+  let ok = true;
+
+  if (rat <= PRIME_MAX_RAT) reasons.push(`Clean insiders (${(rat*100).toFixed(0)}% rat)`); else ok = false;
+  if (top10 <= PRIME_MAX_TOP10) reasons.push(`Distributed (top10 ${(top10*100).toFixed(0)}%)`); else ok = false;
+  if (snipers >= PRIME_MIN_SNIPER) reasons.push(`${snipers} snipers = hype`); else ok = false;
+  if (smart >= PRIME_MIN_SMART) reasons.push(`${smart} smart money`); else ok = false;
+
+  return { isPrime: ok, reasons };
+}
+
+// Fires a separate flashy alert when a prime setup is detected — for instant manual buy
+async function sendPrimeAlert(token, prime) {
+  const mint = token.address, sym = token.symbol || "???";
+  const msg =
+    `🚨🚨🚨 *PRIME SETUP DETECTED* 🚨🚨🚨\n`+
+    `⚡⚡ *INSTANT BUY CANDIDATE* ⚡⚡\n\n`+
+    `🔥 *$${sym}*\n\`${mint}\`\n\n`+
+    `✅ *Why it's PRIME:*\n`+
+    prime.reasons.map(r=>`  ✓ ${r}`).join("\n")+`\n\n`+
+    `📊 MC: ${fmt(token.market_cap||0)} | Vol: ${fmt(token.volume||0)}\n`+
+    `👑 KOL: ${token.renowned_count||0} | 🤖 Smart: ${token.smart_degen_count||0}\n\n`+
+    `💰💰 *MOVE FAST — pattern that ran 37x* 💰💰\n`+
+    `⚠️ High risk, size accordingly, take initials at 2x`;
+  await bot.sendMessage(CHAT_ID, msg, {
+    parse_mode:"Markdown",
+    disable_web_page_preview:true,
+    reply_markup: buildKeyboard(mint, false)
+  }).catch(e=>log(`Prime alert error: ${e.message}`));
+  log(`🚨 PRIME SETUP: $${sym} — ${prime.reasons.join(", ")}`);
+}
+
 // ─── KEYBOARD ─────────────────────────────────────────────────────────────────
 function buildKeyboard(mint,isPump) {
   return {inline_keyboard:[
@@ -1306,6 +1429,7 @@ async function sendKOLAlert(token,ai) {
     `├ 📢 DEX: ${getDexPromo(token)}\n`+
     `└ 🌐 ${getSocials(token)}${devQualityStr}\n\n`+
     `${getInsiderAnalysis(token)}\n\n`+
+`${getSocialTrust(token)}\n\n`+
     `💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,false)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kol",token.creator||token.creator_address||"");
@@ -1345,6 +1469,7 @@ async function sendPumpAlert(token,ai) {
     `🌐 ${getSocials(token)}\n`+
     `${devQualityStr}`+
     `${getInsiderAnalysis(token)}\n\n`+
+`${getSocialTrust(token)}\n\n`+
     `⚡ Buy before Raydium migration!\n💰 *Snipe 0.1 SOL?*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"pump",token.creator||token.creator_address||"");
@@ -1389,6 +1514,7 @@ async function sendUltraAlert(token,ai) {
     `🌐 ${getSocials(token)}\n`+
     `${devQualityStr}`+
     `${getInsiderAnalysis(token)}\n\n`+
+`${getSocialTrust(token)}\n\n`+
     `💰 *Snipe 0.1 SOL?* — Always DYOR`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"ultra",token.creator||token.creator_address||"");
@@ -1436,6 +1562,7 @@ async function sendKOLEarlyAlert(token,ai) {
     `🌐 ${getSocials(token)}\n`+
     `${devQualityStr}`+
     `${getInsiderAnalysis(token)}\n\n`+
+`${getSocialTrust(token)}\n\n`+
     `💰 *Snipe early — higher risk, higher reward*`;
   const sent=await bot.sendMessage(CHAT_ID,msg,{parse_mode:"Markdown",disable_web_page_preview:true,reply_markup:buildKeyboard(mint,true)});
   if (token.price) await trackPerformance(mint,parseFloat(token.price),token.market_cap||0,sym,sent.message_id,"kolEarly",token.creator||token.creator_address||"");
@@ -1502,9 +1629,18 @@ async function scan() {
     const copycats = await checkCopycat(token.name||"", token.symbol||"", mint);
     if (copycats > 0) token._copycatWarning = `⚠️ ${copycats+1} tokens named $${token.symbol||"?"}`;
 
+    recordTwitterHandle(token); // v7.5: track X handle reuse across tokens
+
     token._score = calcFinalScore(token, token._ai.confidence, Object.keys(insiderBuys[mint]||{}).length);
 
     globalAlerted.add(mint);alerted.set(mint,Date.now());
+
+    // v7.6: check for PRIME SETUP pattern — fire flashy instant-buy alert first
+    const prime = detectPrimeSetup(token);
+    if (prime.isPrime) {
+      try { await sendPrimeAlert(token, prime); } catch(e){ log(`Prime err: ${e.message}`); }
+    }
+
     try {
       if (token._type==="kolEarly") await sendKOLEarlyAlert(token,token._ai);
       else if (token._type==="ultra") await sendUltraAlert(token,token._ai);
@@ -1523,7 +1659,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7.4 — insider analysis panel added");
+  log("⚡ Apex v7.6 — Prime Setup instant-buy alerts");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1531,13 +1667,15 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7.4 Online*\n\n`+
+    `⚡ *Apex v7.6 Online*\n\n`+
     `🔧 NEW: Stricter KOL filter (v12 elite values)\n`+
     `  • Holders ≥40, Liq ≥$7K, Rug <18%\n`+
     `  • Bundle <25%, Smart ≥1, Top10 <35%\n`+
     `  • Anti-farm: blocks fake holder counts\n`+
     `  → Cuts breakeven flood, raises quality\n`+
-    `🕵️ NEW: Insider Analysis panel (bundlers, snipers, rat traders)\n\n`+
+    `🕵️ Insider Analysis panel (bundlers, snipers, rat traders)\n`+
+    `🔎 Social Trust — recycled X handle + link checks\n`+
+    `🚨 NEW: PRIME SETUP alerts — flashy instant-buy on the 37x pattern\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 5 Signals: KOL + Pump + Ultra + 👑 KOL Early + 📊 Stable Gem\n`+
     `📊 Stable Gem — $500K–$1M MC, stable 24h+\n`+
