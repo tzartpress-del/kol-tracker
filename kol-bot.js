@@ -222,7 +222,7 @@ bot.on("callback_query", async (q) => {
       await bot.answerCallbackQuery(q.id);
       const s=botStats;
       await bot.sendMessage(CHAT_ID,
-        `📊 *Apex v7.6 Stats*\n\n`+
+        `📊 *Apex v7.7 Stats*\n\n`+
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
@@ -892,6 +892,13 @@ function processUltraList(list, seen, results) {
   for (const t of list) {
     if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
     seen.add(t.address);
+    
+    // ─── LAUNCHPAD FILTER (v7.7): Skip Meteora — too many fake metrics at launch ─
+    const launchpad = (t.launchpad||"").toLowerCase();
+    if (launchpad.includes("meteora")||launchpad.includes("bonding")) {
+      continue;  // skip meteora entirely for ultra early — use pump.fun instead
+    }
+    
     const ageMs   = t.created_timestamp?(Date.now()-t.created_timestamp*1000)
                   : t.open_timestamp?(Date.now()-t.open_timestamp*1000):null;
     if (!ageMs||ageMs>ULTRA_MAX_AGE_MS) continue;
@@ -1659,7 +1666,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7.6 — Prime Setup instant-buy alerts");
+  log("⚡ Apex v7.7 — Meteora launchpad filter for Ultra Early");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1667,10 +1674,10 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7.6 Online*\n\n`+
-    `🔧 NEW: Stricter KOL filter (v12 elite values)\n`+
-    `  • Holders ≥40, Liq ≥$7K, Rug <18%\n`+
-    `  • Bundle <25%, Smart ≥1, Top10 <35%\n`+
+    `⚡ *Apex v7.7 Online*\n\n`+
+    `🔧 NEW: Meteora launchpad filter for Ultra Early\n`+
+    `  • Skips all Meteora/bonding curve coins\n`+
+    `  • Trusts Pump.fun only for Ultra Early\n`+
     `  • Anti-farm: blocks fake holder counts\n`+
     `  → Cuts breakeven flood, raises quality\n`+
     `🕵️ Insider Analysis panel (bundlers, snipers, rat traders)\n`+
