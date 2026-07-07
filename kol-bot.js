@@ -222,7 +222,7 @@ bot.on("callback_query", async (q) => {
       await bot.answerCallbackQuery(q.id);
       const s=botStats;
       await bot.sendMessage(CHAT_ID,
-        `📊 *Apex v7.7 Stats*\n\n`+
+        `📊 *Apex v7.8 Stats*\n\n`+
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
@@ -867,6 +867,14 @@ function processPumpList(list, seen, results) {
 }
 
 // ─── ULTRA SIGNALS ────────────────────────────────────────────────────────────
+// Ultra Early: same platform list minus Meteora — request-level exclude so the
+// OpenAPI fallback never even returns Meteora coins (v7.8). Public scrape path
+// can't take this param, so the processUltraList code-level check (below)
+// stays as the safety net for that path.
+const ULTRA_LAUNCHPAD_PLATFORMS = SOL_LAUNCHPAD_PLATFORMS.filter(
+  p => !p.toLowerCase().includes("meteora")
+);
+
 async function getUltraSignals() {
   const seen=new Set(), results=[];
   const pubResponses=await Promise.allSettled([
@@ -882,6 +890,7 @@ async function getUltraSignals() {
   if (!publicWorked) {
     log("Public Ultra failed — using OpenAPI");
     const body=buildTrenchesBody(["new_creation"]);
+    body.new_creation.launchpad_platform = ULTRA_LAUNCHPAD_PLATFORMS;  // v7.8: exclude meteora at request level
     const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",body},"POST");
     if (data) processUltraList(data?.data?.new_creation||[],seen,results);
   }
@@ -1666,7 +1675,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7.7 — Meteora launchpad filter for Ultra Early");
+  log("⚡ Apex v7.8 — API-level Meteora exclude for Ultra Early");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1674,10 +1683,10 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7.7 Online*\n\n`+
-    `🔧 NEW: Meteora launchpad filter for Ultra Early\n`+
-    `  • Skips all Meteora/bonding curve coins\n`+
-    `  • Trusts Pump.fun only for Ultra Early\n`+
+    `⚡ *Apex v7.8 Online*\n\n`+
+    `🔧 NEW: Meteora excluded at the API request level\n`+
+    `  • Ultra Early now requests Pump.fun-family platforms only\n`+
+    `  • Code-level skip stays as fallback for public-scrape path\n`+
     `  • Anti-farm: blocks fake holder counts\n`+
     `  → Cuts breakeven flood, raises quality\n`+
     `🕵️ Insider Analysis panel (bundlers, snipers, rat traders)\n`+
