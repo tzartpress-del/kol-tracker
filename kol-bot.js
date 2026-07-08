@@ -222,7 +222,7 @@ bot.on("callback_query", async (q) => {
       await bot.answerCallbackQuery(q.id);
       const s=botStats;
       await bot.sendMessage(CHAT_ID,
-        `📊 *Apex v7.8 Stats*\n\n`+
+        `📊 *Apex v7.9 Stats*\n\n`+
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
@@ -867,10 +867,10 @@ function processPumpList(list, seen, results) {
 }
 
 // ─── ULTRA SIGNALS ────────────────────────────────────────────────────────────
-// Ultra Early: same platform list minus Meteora — request-level exclude so the
-// OpenAPI fallback never even returns Meteora coins (v7.8). Public scrape path
-// can't take this param, so the processUltraList code-level check (below)
-// stays as the safety net for that path.
+// Ultra Early only: same platform list minus Meteora. Meteora's bonding-curve
+// coins are trivially fakeable (cheap sybil holders + wash volume at launch),
+// which is why Ultra kept firing on Meteora scams. KOL/Pump/KOL-Early are left
+// untouched — they use SOL_LAUNCHPAD_PLATFORMS as before.
 const ULTRA_LAUNCHPAD_PLATFORMS = SOL_LAUNCHPAD_PLATFORMS.filter(
   p => !p.toLowerCase().includes("meteora")
 );
@@ -890,7 +890,7 @@ async function getUltraSignals() {
   if (!publicWorked) {
     log("Public Ultra failed — using OpenAPI");
     const body=buildTrenchesBody(["new_creation"]);
-    body.new_creation.launchpad_platform = ULTRA_LAUNCHPAD_PLATFORMS;  // v7.8: exclude meteora at request level
+    body.new_creation.launchpad_platform = ULTRA_LAUNCHPAD_PLATFORMS; // exclude meteora at request level
     const data=await fetchOpenAPI("/v1/trenches",{chain:"sol",body},"POST");
     if (data) processUltraList(data?.data?.new_creation||[],seen,results);
   }
@@ -901,13 +901,12 @@ function processUltraList(list, seen, results) {
   for (const t of list) {
     if (!t.address||seen.has(t.address)||globalAlerted.has(t.address)) continue;
     seen.add(t.address);
-    
-    // ─── LAUNCHPAD FILTER (v7.7): Skip Meteora — too many fake metrics at launch ─
+
+    // Safety-net: skip Meteora here too, in case the public-scrape path (which
+    // can't take the launchpad_platform param) returns one.
     const launchpad = (t.launchpad||"").toLowerCase();
-    if (launchpad.includes("meteora")||launchpad.includes("bonding")) {
-      continue;  // skip meteora entirely for ultra early — use pump.fun instead
-    }
-    
+    if (launchpad.includes("meteora")) continue;
+
     const ageMs   = t.created_timestamp?(Date.now()-t.created_timestamp*1000)
                   : t.open_timestamp?(Date.now()-t.open_timestamp*1000):null;
     if (!ageMs||ageMs>ULTRA_MAX_AGE_MS) continue;
@@ -1199,29 +1198,24 @@ function getSocials(token) {
 }
 
 // ─── SOCIAL TRUST ANALYSIS (v7.5) ────────────────────────────────────────────
-// Free social-legitimacy signals (no paid X API). Flags the cheap-but-real
-// scam tells: missing socials, late-added/changed links, and recycled Twitter
-// handles (scammers reuse the same X handle across many rugged tokens).
-const twitterHandleHistory = new Map(); // handle -> Set of mints seen using it
+const twitterHandleHistory = new Map();
 
 function normalizeHandle(tw) {
   if (!tw) return null;
-  // Extract the handle from a URL or raw string
   let h = tw.toLowerCase().trim();
   h = h.replace(/^https?:\/\/(www\.)?(x|twitter)\.com\//, "");
   h = h.replace(/^@/, "");
-  h = h.split(/[/?]/)[0]; // drop path/query
+  h = h.split(/[/?]/)[0];
   return h || null;
 }
 
-// Track handle usage across tokens — call when processing each token
 function recordTwitterHandle(token) {
   const handle = normalizeHandle(token.twitter || token.twitter_username);
   if (!handle) return 0;
   if (!twitterHandleHistory.has(handle)) twitterHandleHistory.set(handle, new Set());
   const set = twitterHandleHistory.get(handle);
   set.add(token.address);
-  return set.size; // how many distinct tokens have used this handle
+  return set.size;
 }
 
 function getSocialTrust(token) {
@@ -1230,30 +1224,24 @@ function getSocialTrust(token) {
   const web = token.website;
   const count = (tw?1:0) + (tg?1:0) + (web?1:0);
 
-  // Late/changed links — GMGN flag we already pull
   const linksUpdated = token.dexscr_update_link === 1 || token.dexscr_update_link === true;
 
-  // Recycled handle check
   const handle = normalizeHandle(tw);
   const reuse = handle ? (twitterHandleHistory.get(handle)?.size || 0) : 0;
 
   let trustPoints = 0;
   const lines = [];
 
-  // Presence (legit projects usually have all 3)
   if (count === 3)      { lines.push("├ Links: X + TG + Web ✅"); trustPoints += 2; }
   else if (count === 2) { lines.push("├ Links: 2 of 3 🟡"); trustPoints += 1; }
   else if (count === 1) { lines.push("├ Links: only 1 ⚠️"); }
   else                  { lines.push("├ Links: NONE 🔴"); trustPoints -= 1; }
 
-  // Recycled Twitter handle — strong scam signal
   if (reuse >= 3)      { lines.push(`├ ⚠️ X handle reused on ${reuse} tokens 🔴`); trustPoints -= 3; }
   else if (reuse === 2){ lines.push(`├ X handle seen on 2 tokens 🟡`); trustPoints -= 1; }
 
-  // Late-added / changed links
   if (linksUpdated) { lines.push("├ Links recently changed 🟡"); trustPoints -= 1; }
 
-  // Verdict
   let label;
   if (trustPoints >= 2)      label = "🟢 LEGIT signals";
   else if (trustPoints >= 0) label = "🟡 MIXED signals";
@@ -1279,13 +1267,6 @@ function getDexPromo(token) {
 }
 
 // ─── INSIDER ANALYSIS (v7.4) ─────────────────────────────────────────────────
-// Surfaces the GMGN insider/manipulation fields we already fetch but never showed.
-// Confirmed field names from GMGNAI/gmgn-skills repo:
-//   bundler_trader_amount_rate — % volume from bot-bundled launch buys
-//   rat_trader_amount_rate     — % volume from insider/sneak wallets
-//   sniper_count               — wallets that bought at exact launch moment
-//   is_wash_trading            — coordinated fake volume flag
-// GMGN's official manipulation threshold: any rate > 0.30 = high risk.
 function getInsiderAnalysis(token) {
   const bundler = token.bundler_trader_amount_rate ?? token.bundler_rate ?? null;
   const rat     = token.rat_trader_amount_rate ?? null;
@@ -1293,7 +1274,6 @@ function getInsiderAnalysis(token) {
   const wash    = token.is_wash_trading || false;
   const top10   = token.top_10_holder_rate ?? null;
 
-  // Build a risk score from the available signals (GMGN threshold: >0.3 = high)
   let riskPoints = 0;
   const lines = [];
 
@@ -1322,34 +1302,23 @@ function getInsiderAnalysis(token) {
   }
   if (wash) { lines.push(`├ ⚠️ Wash trading detected`); riskPoints += 3; }
 
-  // If GMGN gave us none of these fields, say so honestly rather than fake a score
   if (lines.length === 0) return "🕵️ Insider data: N/A (check Bubblemaps)";
 
-  // Overall risk label
   let riskLabel;
   if (riskPoints >= 5)      riskLabel = "🔴 HIGH insider risk";
   else if (riskPoints >= 2) riskLabel = "🟡 MEDIUM insider risk";
   else                       riskLabel = "🟢 LOW insider risk";
 
-  // Replace last line's ├ with └ for clean formatting
   lines[lines.length-1] = lines[lines.length-1].replace("├", "└");
 
   return `🕵️ *Insider Analysis* — ${riskLabel}\n${lines.join("\n")}`;
 }
 
 // ─── PRIME SETUP DETECTOR (v7.6) ─────────────────────────────────────────────
-// Pattern observed to outperform (the 37x signature): genuine hype, not insider rug.
-//   • Insider/rat LOW (<10%)      — no sneaky insider wallets ready to dump
-//   • Top 10 hold LOW (<30%)      — distributed, not whale/single-entity controlled
-//   • Snipers PRESENT (>=8)       — real early demand/hype (not one bundle)
-//   • Not wash trading
-// Bundlers can be high here — when paired with low rat + low top10, it reads as
-// competing snipers rather than one coordinated rug.
-// Returns {isPrime, reasons[]} — used to fire a flashy instant-buy alert.
-const PRIME_MAX_RAT    = 0.10;  // insider/rat must be under 10%
-const PRIME_MAX_TOP10  = 0.30;  // top 10 holders under 30%
-const PRIME_MIN_SNIPER = 8;     // at least 8 snipers = real demand
-const PRIME_MIN_SMART  = 1;     // at least 1 smart money confirms
+const PRIME_MAX_RAT    = 0.10;
+const PRIME_MAX_TOP10  = 0.30;
+const PRIME_MIN_SNIPER = 8;
+const PRIME_MIN_SMART  = 1;
 
 function detectPrimeSetup(token) {
   const rat     = token.rat_trader_amount_rate ?? null;
@@ -1359,7 +1328,6 @@ function detectPrimeSetup(token) {
   const wash    = token.is_wash_trading || false;
   const honeypot= token.is_honeypot || false;
 
-  // Need the core fields present to judge — if missing, can't confirm prime
   if (rat === null || top10 === null || snipers === null) return { isPrime:false };
   if (wash || honeypot) return { isPrime:false };
 
@@ -1374,7 +1342,6 @@ function detectPrimeSetup(token) {
   return { isPrime: ok, reasons };
 }
 
-// Fires a separate flashy alert when a prime setup is detected — for instant manual buy
 async function sendPrimeAlert(token, prime) {
   const mint = token.address, sym = token.symbol || "???";
   const msg =
@@ -1645,13 +1612,12 @@ async function scan() {
     const copycats = await checkCopycat(token.name||"", token.symbol||"", mint);
     if (copycats > 0) token._copycatWarning = `⚠️ ${copycats+1} tokens named $${token.symbol||"?"}`;
 
-    recordTwitterHandle(token); // v7.5: track X handle reuse across tokens
+    recordTwitterHandle(token);
 
     token._score = calcFinalScore(token, token._ai.confidence, Object.keys(insiderBuys[mint]||{}).length);
 
     globalAlerted.add(mint);alerted.set(mint,Date.now());
 
-    // v7.6: check for PRIME SETUP pattern — fire flashy instant-buy alert first
     const prime = detectPrimeSetup(token);
     if (prime.isPrime) {
       try { await sendPrimeAlert(token, prime); } catch(e){ log(`Prime err: ${e.message}`); }
@@ -1675,7 +1641,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7.8 — API-level Meteora exclude for Ultra Early");
+  log("⚡ Apex v7.9 — Meteora excluded from Ultra Early (request + code level)");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1683,15 +1649,19 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7.8 Online*\n\n`+
-    `🔧 NEW: Meteora excluded at the API request level\n`+
-    `  • Ultra Early now requests Pump.fun-family platforms only\n`+
-    `  • Code-level skip stays as fallback for public-scrape path\n`+
+    `⚡ *Apex v7.9 Online*\n\n`+
+    `🔧 NEW: Ultra Early excludes Meteora\n`+
+    `  • Meteora bonding-curve coins are cheap to fake (sybil holders, wash volume)\n`+
+    `  • Excluded at the API request level, code-level skip as fallback\n`+
+    `  • KOL/Pump/KOL-Early unaffected — still scan all platforms\n\n`+
+    `🔧 Stricter KOL filter (v12 elite values)\n`+
+    `  • Holders ≥40, Liq ≥$7K, Rug <18%\n`+
+    `  • Bundle <25%, Smart ≥1, Top10 <35%\n`+
     `  • Anti-farm: blocks fake holder counts\n`+
     `  → Cuts breakeven flood, raises quality\n`+
     `🕵️ Insider Analysis panel (bundlers, snipers, rat traders)\n`+
     `🔎 Social Trust — recycled X handle + link checks\n`+
-    `🚨 NEW: PRIME SETUP alerts — flashy instant-buy on the 37x pattern\n\n`+
+    `🚨 PRIME SETUP alerts — flashy instant-buy on the 37x pattern\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
     `🎯 5 Signals: KOL + Pump + Ultra + 👑 KOL Early + 📊 Stable Gem\n`+
     `📊 Stable Gem — $500K–$1M MC, stable 24h+\n`+
