@@ -63,6 +63,25 @@ const STABLE_GEM_BUY_RATIO_MIN    = 1.2;
 const STABLE_GEM_MAX_AGE_DAYS     = 30;
 const STABLE_GEM_COOLDOWN_MS      = 24 * 60 * 60 * 1000;
 
+
+// ─── REVIVAL SCANNER CONFIG (v7.10) ───────────────────────────────────────────
+// Detects sudden reactivation of stale, low-mc tokens — the "CTO / influencer
+// adoption" pattern (e.g. a ~20-day-old token pumping from ~175K to ~400M mc)
+// that the other 5 signals miss, since they're all tuned for FRESH launches.
+// This scanner watches a rotating list of previously-seen tokens instead of
+// scanning fresh mints, and fires when volume/holders spike vs. their own
+// trailing baseline — not vs. fixed thresholds like the other signals.
+const REVIVAL_INTERVAL_MS        = 5 * 60 * 1000;   // scan every 5 min (own loop, not the 60s main scan)
+const REVIVAL_MIN_AGE_MS         = 3 * 24 * 60 * 60 * 1000;  // token must be >3 days old (excludes fresh-launch signals)
+const REVIVAL_MC_MAX             = 500_000;          // still "cheap" — ceiling per the plan
+const REVIVAL_MC_MIN             = 5_000;            // filter out fully-dead/zero-liquidity tokens
+const REVIVAL_VOLUME_SPIKE_MULT  = 5;                // 1h volume must be >=5x the trailing 24h-average hourly volume
+const REVIVAL_MIN_HOLDER_JUMP    = 20;                // OR holder count grew by at least this many since last check
+const REVIVAL_MIN_VOLUME_1H      = 5_000;            // floor so we don't fire on $50 of trailing volume looking like a "spike"
+const REVIVAL_COOLDOWN_MS        = 24 * 60 * 60 * 1000; // don't re-alert same token within 24h
+const REVIVAL_WATCHLIST_MAX      = 500;              // cap how many tokens we track to avoid unbounded memory growth
+const REVIVAL_MAX_BASELINE_AGE_MS = 30 * 24 * 60 * 60 * 1000; // stop watching tokens older than 30 days (matches plan's "cheap" window)
+
 // ─── V12 ELITE FILTER VALUES (v7.3) ───────────────────────────────────────────
 // Ported from v12 "elite" code to cut the breakeven flood. Applied in hardFilter.
 const ELITE_MIN_HOLDERS   = 40;
@@ -96,12 +115,21 @@ const devWalletCache      = new Map();
 const trustedDevs         = new Map();
 const stableGemAlerted   = new Map();
 
+// ─── REVIVAL SCANNER STATE (v7.10) ────────────────────────────────────────────
+// watchedTokens: mint -> { symbol, firstSeen, baselineVol24h, lastCheckedVol1h, lastMc }
+// Tracks stale/low-mc tokens over time so we can detect a volume/holder spike
+// (CTO-style reactivation) rather than just scanning fresh launches.
+const watchedTokens      = new Map();
+const revivalAlerted     = new Map();
+
 const botStats = {
   kol:        { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
   pump:       { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
   ultra:      { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
   kolEarly:   { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
   stableGem:  { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
+  revival:    { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
+  revival:    { alerts: 0, hits2x: 0, hits5x: 0, hits10x: 0 },
 };
 
 function log(msg) { console.log(`[${new Date().toISOString()}] ${msg}`); }
@@ -222,12 +250,14 @@ bot.on("callback_query", async (q) => {
       await bot.answerCallbackQuery(q.id);
       const s=botStats;
       await bot.sendMessage(CHAT_ID,
-        `📊 *Apex v7.9 Stats*\n\n`+
+        `📊 *Apex v7.10 Stats*\n\n`+
         `KOL: ${s.kol.alerts} | 2x:${s.kol.hits2x} 5x:${s.kol.hits5x} 10x:${s.kol.hits10x}\n`+
         `Pump: ${s.pump.alerts} | 2x:${s.pump.hits2x} 5x:${s.pump.hits5x} 10x:${s.pump.hits10x}\n`+
         `Ultra: ${s.ultra.alerts} | 2x:${s.ultra.hits2x} 5x:${s.ultra.hits5x} 10x:${s.ultra.hits10x}\n`+
         `KOL Early: ${s.kolEarly.alerts} | 2x:${s.kolEarly.hits2x} 5x:${s.kolEarly.hits5x} 10x:${s.kolEarly.hits10x}\n`+
-        `Stable Gem: ${s.stableGem.alerts} | 2x:${s.stableGem.hits2x} 5x:${s.stableGem.hits5x} 10x:${s.stableGem.hits10x}\n\n`+
+        `Stable Gem: ${s.stableGem.alerts} | 2x:${s.stableGem.hits2x} 5x:${s.stableGem.hits5x} 10x:${s.stableGem.hits10x}\n`+
+        `Revival: ${s.revival.alerts} | 2x:${s.revival.hits2x} 5x:${s.revival.hits5x} 10x:${s.revival.hits10x}\n`+
+        `Revival: ${s.revival.alerts} | 2x:${s.revival.hits2x} 5x:${s.revival.hits5x} 10x:${s.revival.hits10x}\n\n`+
         `AI: ${aiCallsToday}/${AI_DAILY_LIMIT} | Tracking: ${performanceTracker.size}\n`+
         `Blacklisted creators: ${blacklistedCreators.size}`,
         { parse_mode:"Markdown" }
@@ -1184,6 +1214,231 @@ async function sendStableGemAlert(token, volatility, buySellRatio) {
   }).catch(()=>{});
 }
 
+// ─── REVIVAL SCANNER (v7.10) ─────────────────────────────────────────────────
+// 6th signal type. Detects sudden reactivation of stale, low-mc tokens — the
+// "CTO / influencer adoption" pattern the other 5 signals structurally can't
+// catch, since KOL/Pump/Ultra/KOL-Early/Stable-Gem are all built around either
+// fresh mints or already-stable mid-cap tokens. This one:
+//   1. Builds a rotating watchlist of tokens that are older than 3 days and
+//      still cheap (<$500K mc) — i.e. tokens everyone has already forgotten.
+//   2. Each cycle, re-checks each watched token's current volume/holders
+//      against ITS OWN previous reading (not a fixed threshold) to catch a
+//      sudden spike — a real "someone just noticed this" moment.
+//   3. Fires an alert only on that spike, same as the other signal types.
+//
+// Runs on its own 5-min interval (REVIVAL_INTERVAL_MS), separate from the
+// 60s main scan loop, since "stale token" scanning doesn't need 60s freshness
+// and would otherwise multiply our GMGN/DexScreener call volume for no benefit.
+
+async function fetchRevivalCandidates() {
+  // Pull a broad, cheap slice of the market to seed/refresh the watchlist.
+  // Two queries, not one: sorting purely ascending by mc would repeatedly
+  // return the same near-zero dust tokens every cycle. Mixing in a
+  // volume-sorted pull (still filtered to the cheap/old profile downstream
+  // in updateWatchlist) gives broader coverage across the sub-$500K range
+  // without biasing the baseline reading itself toward already-spiking tokens.
+  const urls = [
+    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/24h?orderby=marketcap&direction=asc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
+    `https://gmgn.ai/defi/quotation/v1/rank/sol/swaps/24h?orderby=holder_count&direction=desc&filters[]=not_honeypot&filters[]=renounced&limit=100`,
+  ];
+  try {
+    const responses = await Promise.allSettled(urls.map(u => fetchPublic(u)));
+    let combined = [];
+    for (const r of responses) {
+      if (r.status==="fulfilled" && r.value?.data?.rank?.length) combined.push(...r.value.data.rank);
+    }
+    if (combined.length) return combined;
+    log("[Revival] Public failed — trying OpenAPI");
+    const apiData = await fetchOpenAPI("/v1/market/rank", {
+      chain:"sol", interval:"24h", orderby:"marketcap", direction:"asc", limit:"100"
+    });
+    return extractList(apiData);
+  } catch(e) {
+    log(`[Revival] fetchCandidates error: ${e.message}`);
+    return [];
+  }
+}
+
+// Update (or seed) the watchlist with a fresh batch of candidates.
+// Returns nothing — mutates watchedTokens in place.
+function updateWatchlist(candidates) {
+  const now = Date.now();
+  for (const t of candidates) {
+    if (!t.address) continue;
+    const mc = t.market_cap || t.usd_market_cap || 0;
+    const ageMs = t.open_timestamp ? (now - t.open_timestamp * 1000) : null;
+
+    // Only watch tokens that fit the revival profile: old enough, still cheap
+    if (ageMs === null || ageMs < REVIVAL_MIN_AGE_MS) continue;
+    if (ageMs > REVIVAL_MAX_BASELINE_AGE_MS) continue;
+    if (mc < REVIVAL_MC_MIN || mc > REVIVAL_MC_MAX) continue;
+    if (t.is_honeypot || t.is_blacklist) continue;
+
+    const vol1h = t.volume_1h || t.volume || 0;
+    const vol24h = t.volume_24h || t.volume || 0;
+    const holders = t.holder_count || 0;
+
+    const existing = watchedTokens.get(t.address);
+    if (!existing) {
+      // First time seeing this token — record it as a baseline, no spike check yet.
+      // avgHourlyVol24h approximates a "normal" hour for this token from its 24h volume.
+      watchedTokens.set(t.address, {
+        symbol: t.symbol || "???",
+        firstSeen: now,
+        lastCheckedTs: now,
+        avgHourlyVol24h: vol24h / 24,
+        lastVol1h: vol1h,
+        lastHolders: holders,
+        lastMc: mc,
+      });
+    } else {
+      // Refresh the rolling baseline gently (don't overwrite lastVol1h here —
+      // that's compared against fresh reads in checkForRevival, not here).
+      existing.avgHourlyVol24h = vol24h / 24;
+      existing.lastMc = mc;
+    }
+  }
+
+  // Prune: drop anything that's aged out of the watch window, or if the
+  // watchlist has grown past our memory cap (drop oldest-seen first).
+  for (const [mint, w] of watchedTokens.entries()) {
+    if (now - w.firstSeen > REVIVAL_MAX_BASELINE_AGE_MS) watchedTokens.delete(mint);
+  }
+  if (watchedTokens.size > REVIVAL_WATCHLIST_MAX) {
+    const excess = watchedTokens.size - REVIVAL_WATCHLIST_MAX;
+    const oldest = [...watchedTokens.entries()].sort((a,b)=>a[1].firstSeen-b[1].firstSeen).slice(0, excess);
+    for (const [mint] of oldest) watchedTokens.delete(mint);
+  }
+}
+
+// Re-check each watched token for a live volume/holder spike vs its own baseline.
+// Uses DexScreener (same source as trackPerformance) since we need current
+// per-token data, not another full market-rank pull.
+async function checkForRevival() {
+  const candidates = [];
+  const now = Date.now();
+
+  for (const [mint, w] of watchedTokens.entries()) {
+    if (revivalAlerted.has(mint) && now - revivalAlerted.get(mint) < REVIVAL_COOLDOWN_MS) continue;
+    candidates.push([mint, w]);
+  }
+  if (!candidates.length) return;
+
+  log(`[Revival] Re-checking ${candidates.length} watched tokens for spikes...`);
+
+  for (const [mint, w] of candidates) {
+    await new Promise(r => setTimeout(r, 1200)); // gentle pacing on DexScreener
+    const cur = await getTokenPrice(mint); // { price, mc, liquidity, sells, buys } — already exists (trackPerformance uses it)
+    if (!cur) continue;
+
+    // Pull fresh volume/holders via GMGN security/token endpoint (cheap, cached upstream)
+    let vol1h = null, holders = null;
+    try {
+      const sec = await fetchOpenAPI("/v1/token/security", { chain:"sol", address:mint });
+      if (sec?.data) {
+        vol1h = sec.data.volume_1h ?? null;
+        holders = sec.data.holder_count ?? null;
+      }
+    } catch(e) { /* fall through — DexScreener liquidity/price still usable below */ }
+
+    const mc = cur.mc || w.lastMc || 0;
+    if (mc > REVIVAL_MC_MAX * 3) { watchedTokens.delete(mint); continue; } // clearly no longer "cheap" — drop from watch
+
+    const volumeSpike = (vol1h !== null && w.avgHourlyVol24h > 0)
+      ? vol1h >= w.avgHourlyVol24h * REVIVAL_VOLUME_SPIKE_MULT && vol1h >= REVIVAL_MIN_VOLUME_1H
+      : false;
+    const holderJump = (holders !== null && w.lastHolders)
+      ? (holders - w.lastHolders) >= REVIVAL_MIN_HOLDER_JUMP
+      : false;
+
+    if (volumeSpike || holderJump) {
+      revivalAlerted.set(mint, now);
+      await sendRevivalAlert(mint, w, { price: cur.price, mc, vol1h, holders, volumeSpike, holderJump });
+    }
+
+    // Update rolling readings for next cycle regardless of whether it fired
+    if (vol1h !== null) w.lastVol1h = vol1h;
+    if (holders !== null) w.lastHolders = holders;
+    w.lastCheckedTs = now;
+  }
+
+  // Cleanup old cooldown entries
+  for (const [mint, ts] of revivalAlerted.entries()) {
+    if (now - ts > REVIVAL_COOLDOWN_MS) revivalAlerted.delete(mint);
+  }
+}
+
+async function sendRevivalAlert(mint, watched, info) {
+  const sym = watched.symbol || "???";
+  const reasons = [];
+  if (info.volumeSpike) reasons.push(`Volume 1h ${fmt(info.vol1h)} vs ~${fmt(watched.avgHourlyVol24h)} avg (≥${REVIVAL_VOLUME_SPIKE_MULT}x spike)`);
+  if (info.holderJump)  reasons.push(`Holders jumped +${(info.holders - (watched.lastHolders||0))} (${watched.lastHolders||"?"} → ${info.holders})`);
+
+  const dexUrl  = `https://dexscreener.com/solana/${mint}`;
+  const gmgnUrl = `https://gmgn.ai/sol/token/${mint}`;
+
+  const msg =
+    `♻️ *REVIVAL SIGNAL* — Stale token reactivating\n\n`+
+    `*$${sym}*\n\`${mint}\`\n`+
+    `└ 🕰 Previously stale, now showing life\n\n`+
+    `🔥 *Why it fired*\n`+
+    reasons.map(r=>`├ ${r}`).join("\n")+`\n\n`+
+    `📊 *Current*\n`+
+    `├ Price: ${info.price?`$${parseFloat(info.price).toExponential(4)}`:"N/A"}\n`+
+    `├ MC:    ${fmt(info.mc||0)}\n`+
+    `└ Vol 1h: ${fmt(info.vol1h||0)}\n\n`+
+    `[DexScreener](${dexUrl}) • [GMGN](${gmgnUrl})\n\n`+
+    `⚠️ *Unverified reactivation — check for CTO/news before entry. Could be a pump-and-dump on an old bag.*`;
+
+  const keyboard = {
+    inline_keyboard: [
+      [{text:"🚀 BUY via Trojan", url:`https://t.me/solana_trojanbot?start=ca_${mint}`}],
+      [{text:"📊 DexScreener", url:dexUrl}, {text:"🔍 GMGN", url:gmgnUrl}],
+      [{text:"⚡ Axiom", url:`https://axiom.trade/t/${mint}`}, {text:"📈 Stats", callback_data:"stats"}],
+      [{text:"❌ Skip", callback_data:`skip_${mint.slice(0,20)}`}],
+    ]
+  };
+
+  const sent = await bot.sendMessage(CHAT_ID, msg, {
+    parse_mode: "Markdown",
+    disable_web_page_preview: true,
+    reply_markup: keyboard
+  }).catch(e => { log(`Revival alert send error: ${e.message}`); return null; });
+
+  if (sent && info.price) {
+    await trackPerformance(mint, parseFloat(info.price), info.mc||0, sym, sent.message_id, "revival", null);
+  }
+
+  botStats.revival.alerts++;
+  log(`[Revival] Alert: $${sym} — ${reasons.join(" | ")}`);
+
+  dbInsert("signals", {
+    mint,
+    symbol: sym,
+    signal_type: "REVIVAL",
+    alert_price: info.price ? parseFloat(info.price) : null,
+    alert_mc: info.mc || null,
+    smart_degen_count: 0,
+    rug_ratio: 0,
+    ai_decision: "APPROVED",
+    ai_confidence: 60,
+    has_socials: false,
+    dev_wallet: null,
+  }).catch(()=>{});
+}
+
+async function runRevivalScan() {
+  log("[Revival] Scanning...");
+  try {
+    const candidates = await fetchRevivalCandidates();
+    updateWatchlist(candidates);
+    log(`[Revival] Watchlist size: ${watchedTokens.size}`);
+    await checkForRevival();
+  } catch(e) {
+    log(`[Revival] scan error: ${e.message}`);
+  }
+}
+
 // ─── SOCIALS HELPER ──────────────────────────────────────────────────────────
 function getSocials(token) {
   const parts = [];
@@ -1641,7 +1896,7 @@ async function scan() {
 
 // ─── MAIN ─────────────────────────────────────────────────────────────────────
 async function main() {
-  log("⚡ Apex v7.9 — Meteora excluded from Ultra Early (request + code level)");
+  log("⚡ Apex v7.10 — Revival Scanner (6th signal) added");
   try { const r=await axios.get("https://api.ipify.org?format=json",{timeout:5000}); log(`Railway IP: ${r.data.ip}`); } catch(e){}
   log(`GMGN_API_KEY: ${GMGN_API_KEY?"SET":"MISSING"}`);
   log(`OPENROUTER_KEY: ${OPENROUTER_KEY?"SET":"MISSING"}`);
@@ -1649,8 +1904,13 @@ async function main() {
   await loadTrustedDevs();
 
   await bot.sendMessage(CHAT_ID,
-    `⚡ *Apex v7.9 Online*\n\n`+
-    `🔧 NEW: Ultra Early excludes Meteora\n`+
+    `⚡ *Apex v7.10 Online*\n\n`+
+    `♻️ NEW: Revival Scanner — 6th signal\n`+
+    `  • Watches tokens >3 days old, still <$500K mc\n`+
+    `  • Fires on 1h volume ≥${REVIVAL_VOLUME_SPIKE_MULT}x its own 24h-avg hourly rate, or holder jump ≥${REVIVAL_MIN_HOLDER_JUMP}\n`+
+    `  • Catches CTO / influencer-adoption pumps on EXISTING tokens\n`+
+    `  • Separate 5-min loop — doesn't touch the other 5 signals\n\n`+
+    `🔧 Ultra Early excludes Meteora\n`+
     `  • Meteora bonding-curve coins are cheap to fake (sybil holders, wash volume)\n`+
     `  • Excluded at the API request level, code-level skip as fallback\n`+
     `  • KOL/Pump/KOL-Early unaffected — still scan all platforms\n\n`+
@@ -1663,9 +1923,10 @@ async function main() {
     `🔎 Social Trust — recycled X handle + link checks\n`+
     `🚨 PRIME SETUP alerts — flashy instant-buy on the 37x pattern\n\n`+
     `📡 All platforms: Pump.fun + letsbonk + bonkers + more\n`+
-    `🎯 5 Signals: KOL + Pump + Ultra + 👑 KOL Early + 📊 Stable Gem\n`+
+    `🎯 6 Signals: KOL + Pump + Ultra + 👑 KOL Early + 📊 Stable Gem + ♻️ Revival\n`+
     `📊 Stable Gem — $500K–$1M MC, stable 24h+\n`+
     `👑 KOL Early — 2+ KOLs in fresh tokens <$100K\n`+
+    `♻️ Revival — stale tokens reactivating (CTO / adoption pattern)\n`+
     `🤖 AI: OpenRouter Llama 3.3 70B (200/day)\n`+
     `🌐 Social warnings on all alerts\n`+
     `💾 Supabase signal tracking enabled\n`+
@@ -1675,7 +1936,7 @@ async function main() {
     `🔍 Copycat detection\n`+
     `👛 6 Insider wallets (webhook real-time)\n`+
     `📊 2x/5x/10x milestone alerts\n\n`+
-    `Main scan: every 60s | Stable Gem: every 10min 🔥`,
+    `Main scan: every 60s | Stable Gem: every 10min | ♻️ Revival: every 5min 🔥`,
     {parse_mode:"Markdown"}
   );
 
@@ -1688,6 +1949,11 @@ async function main() {
     runStableGemScan();
     setInterval(runStableGemScan, STABLE_GEM_INTERVAL_MS);
   }, 30000);
+
+  setTimeout(() => {
+    runRevivalScan();
+    setInterval(runRevivalScan, REVIVAL_INTERVAL_MS);
+  }, 45000);
 }
 
 main().catch(e=>{log(`Fatal: ${e.message}`);process.exit(1);});
