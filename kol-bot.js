@@ -81,6 +81,7 @@ const REVIVAL_MIN_VOLUME_1H      = 5_000;            // floor so we don't fire o
 const REVIVAL_COOLDOWN_MS        = 24 * 60 * 60 * 1000; // don't re-alert same token within 24h
 const REVIVAL_WATCHLIST_MAX      = 500;              // cap how many tokens we track to avoid unbounded memory growth
 const REVIVAL_MAX_BASELINE_AGE_MS = 30 * 24 * 60 * 60 * 1000; // stop watching tokens older than 30 days (matches plan's "cheap" window)
+const REVIVAL_MAX_CHECKS_PER_CYCLE = 25; // cap GMGN calls per 5-min cycle — watchlist can grow to 500, but we must not add 500 calls on top of the main scan's own GMGN usage
 
 // ─── V12 ELITE FILTER VALUES (v7.3) ───────────────────────────────────────────
 // Ported from v12 "elite" code to cut the breakeven flood. Applied in hardFilter.
@@ -1324,10 +1325,18 @@ async function checkForRevival() {
   }
   if (!candidates.length) return;
 
-  log(`[Revival] Re-checking ${candidates.length} watched tokens for spikes...`);
+  // Rate-limit protection: GMGN already rate-bans on aggregate call volume
+  // across the WHOLE bot (main scan + Revival share the same IP/key). Never
+  // check the full watchlist in one cycle — cap it and rotate through the
+  // least-recently-checked tokens first, so every token still gets covered
+  // over several cycles instead of only ever checking the same first N.
+  candidates.sort((a, b) => (a[1].lastCheckedTs||0) - (b[1].lastCheckedTs||0));
+  const toCheck = candidates.slice(0, REVIVAL_MAX_CHECKS_PER_CYCLE);
 
-  for (const [mint, w] of candidates) {
-    await new Promise(r => setTimeout(r, 1200)); // gentle pacing on DexScreener
+  log(`[Revival] Re-checking ${toCheck.length}/${candidates.length} watched tokens for spikes (rate-limit capped)...`);
+
+  for (const [mint, w] of toCheck) {
+    await new Promise(r => setTimeout(r, 2500)); // matches fetchOpenAPI's own 2s throttle + margin, since these calls share the same GMGN rate budget as the main scan
     const cur = await getTokenPrice(mint); // { price, mc, liquidity, sells, buys } — already exists (trackPerformance uses it)
     if (!cur) continue;
 
